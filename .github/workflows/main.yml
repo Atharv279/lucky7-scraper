@@ -9,9 +9,11 @@ jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 55             # ~50-55 minutes per run
+    # Queue runs; DO NOT cancel the one that's currently running
     concurrency:
-      group: lucky7-scrape          # queue runs; no overlap
+      group: lucky7-scrape-${{ github.ref }}   # one at a time per branch
       cancel-in-progress: false
+
     permissions:
       contents: write
 
