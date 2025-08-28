@@ -2,23 +2,26 @@ name: Lucky7 Scraper (near-24/7)
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/5 * * * *"        # every 5 minutes
   workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 55
+    # Queue runs; do NOT cancel the one currently scraping
     concurrency:
       group: lucky7-scrape-${{ github.ref }}
       cancel-in-progress: false
+
     permissions:
       contents: write
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -29,7 +32,7 @@ jobs:
       - name: Install Google Chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Install Xvfb
+      - name: Install Xvfb (virtual display)
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Install Python deps
@@ -50,6 +53,7 @@ jobs:
           MAX_ROUNDS: "0"
           CSV_PATH: "lucky7_data.csv"
           PYTHONUNBUFFERED: "1"
+          DEBUG_DUMP: "1"
         run: |
           xvfb-run -a -s "-screen 0 1600x900x24" python -u scraper.py
 
