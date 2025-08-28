@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Lucky 7 — Single-File Scraper (GitHub-ready, non-headless)  v3.0
+Lucky 7 — Single-File Scraper (GitHub-ready, non-headless)  v3.1
 
-What this does
-- Logs into the same site, navigates: Casino → Lucky 7 → first game.
-- Enters game iframe when present.
-- Scrapes the open card by reading the card image URL (DT-style parsing).
-- Parses rank & suit from URL patterns (e.g., /8D.png, /10CC.webp, queen_of_spades.png).
-- Skips closed/back placeholders (e.g., 1_card_20_20.webp, alt="closed").
-- Saves a clean CSV with a single 'result' column (below7/seven/above7).
-- Runs for MAX_ROUNDS per run (default 20), then exits (for CI schedules).
+Key update:
+- If the "Casino" nav click isn't found in CI, we fall back to LUCKY7_PANEL_URL (env),
+  opening the Lucky-7 panel page directly.
+
+Outputs clean CSV: data/lucky7_data.csv with columns:
+ts_utc, round_id, rank, suit_key, color, result
 """
 
 import os, re, csv, time, random
@@ -28,19 +26,19 @@ from webdriver_manager.chrome import ChromeDriverManager
 
 # ===================== CONFIG =====================
 URL = os.getenv("LUCKY7_URL", "https://nohmy99.vip/home")
+PANEL_URL = os.getenv("LUCKY7_PANEL_URL")  # <- set this in GitHub Actions Variables
 
-# Require env vars (don’t hardcode secrets)
 USERNAME = os.getenv("NOH_USER")
 PASSWORD = os.getenv("NOH_PASS")
 if not USERNAME or not PASSWORD:
-    raise SystemExit("Missing NOH_USER / NOH_PASS environment variables. Set them before running.")
+    raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
 CSV_PATH = os.getenv("CSV_PATH", "data/lucky7_data.csv")
 POLL_SEC = float(os.getenv("POLL_SEC", "1.2"))
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
-MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "20"))  # collect at least this many rows per run
+MAX_ROUNDS = int(os.getenv("MAX_ROUNDS", "20"))  # collect this many rows per run
 
-# Non-headless by design; in CI use: xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py
+# Non-headless; in CI, wrap with: xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py
 VISIBLE_BROWSER = True
 
 # ===================== CSV =====================
@@ -169,13 +167,13 @@ def safe_click(driver, el):
 # ===================== Site flow =====================
 def login_same_site(driver):
     driver.get(URL)
-    time.sleep(2.0)
-    # Open login form
+    time.sleep(3.0)
+    # Open login form if visible
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(1.0)
-    # Fill creds
+    time.sleep(1.2)
+    # Fill creds (name attributes from your site)
     try:
         user_input = driver.find_element(By.XPATH, "//input[@name='User Name']")
         pass_input = driver.find_element(By.XPATH, "//input[@name='Password']")
@@ -184,44 +182,84 @@ def login_same_site(driver):
         pass_input.submit()
     except NoSuchElementException:
         pass  # maybe already logged in
+    time.sleep(3.0)
 
-def click_nav_casino(driver):
-    el = W(driver, EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/casino/') or contains(., 'Casino')]")))
-    safe_click(driver, el)
-    time.sleep(1.0 + random.uniform(0.1,0.4))
+def click_nav_casino_or_fallback(driver):
+    """
+    Try to click the Casino nav. If not found within 15s, use LUCKY7_PANEL_URL (env) as fallback.
+    """
+    try:
+        # try a few alternative locators
+        xpaths = [
+            "//a[contains(@href, '/casino/')]",
+            "//a[normalize-space()='Casino']",
+            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
+            "//nav//a[contains(@href, '/casino')]",
+        ]
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            for xp in xpaths:
+                els = driver.find_elements(By.XPATH, xp)
+                if els:
+                    el = els[0]
+                    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                    time.sleep(0.2)
+                    safe_click(driver, el)
+                    time.sleep(2.0)
+                    return True
+            time.sleep(0.5)
+        raise TimeoutException("Casino link not found")
+    except Exception as e:
+        if PANEL_URL:
+            print("⚠️  Casino link not found; using LUCKY7_PANEL_URL fallback")
+            driver.get(PANEL_URL)
+            time.sleep(3.0)
+            return True
+        else:
+            print("❌ Casino link not found and no LUCKY7_PANEL_URL provided.")
+            raise
 
 def click_lucky7_subtab(driver):
-    el = W(driver, EC.element_to_be_clickable((
-        By.XPATH,
-        "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY 7') or "
-        "contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]"
-    )))
-    safe_click(driver, el)
-    time.sleep(1.0 + random.uniform(0.1,0.4))
+    try:
+        el = W(driver, EC.element_to_be_clickable((
+            By.XPATH,
+            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY 7') or "
+            "contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]"
+        )), 15)
+        safe_click(driver, el)
+        time.sleep(1.2)
+    except TimeoutException:
+        # If we're already on the Lucky7 detail page, that's fine
+        pass
 
 def click_first_game_in_active_pane(driver):
     try:
-        pane = W(driver, EC.visibility_of_element_located((
-            By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]"
-        )))
-    except TimeoutException:
-        pane = driver
-    tiles = pane.find_elements(By.XPATH, ".//*[contains(@class,'casino-name')]")
-    target = tiles[0].find_element(By.XPATH, "..") if tiles else None
-    if not target:
-        cands = pane.find_elements(By.XPATH, ".//*[contains(@class,'casinoicon') or contains(@class,'casinoicons') or contains(@class,'casino-') or self::a]")
-        target = cands[0] if cands else None
-    if not target:
-        raise RuntimeError("No game tiles found in Lucky 7 pane")
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-    time.sleep(0.2 + random.uniform(0.05,0.2)); safe_click(driver, target)
-    time.sleep(0.6)
-    if len(driver.window_handles) > 1:
-        driver.switch_to.window(driver.window_handles[-1])
-    time.sleep(2.0)
-    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    if iframes:
-        driver.switch_to.frame(iframes[0])
+        try:
+            pane = W(driver, EC.visibility_of_element_located((
+                By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]"
+            )), 10)
+        except TimeoutException:
+            pane = driver
+        tiles = pane.find_elements(By.XPATH, ".//*[contains(@class,'casino-name')]")
+        target = tiles[0].find_element(By.XPATH, "..") if tiles else None
+        if not target:
+            cands = pane.find_elements(By.XPATH, ".//*[contains(@class,'casinoicon') or contains(@class,'casinoicons') or contains(@class,'casino-') or self::a]")
+            target = cands[0] if cands else None
+        if target:
+            driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+            time.sleep(0.2); safe_click(driver, target)
+            time.sleep(1.5)
+        # Switch to game window if opened
+        if len(driver.window_handles) > 1:
+            driver.switch_to.window(driver.window_handles[-1])
+        time.sleep(2.5)
+        # Enter iframe if present
+        iframes = driver.find_elements(By.TAG_NAME, "iframe")
+        if iframes:
+            driver.switch_to.frame(iframes[0])
+    except Exception:
+        # If this fails but the panel URL opened the game directly, proceed anyway
+        pass
 
 def find_round_id_text(driver) -> Optional[str]:
     for sel in [".round-id", ".casino-round-id", "span.roundId", "div.round-id"]:
@@ -240,10 +278,10 @@ def main():
     ensure_csv(CSV_PATH)
 
     try:
-        # Login + nav
+        # Login + nav (with fallback)
         login_same_site(driver)
         W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 20)
-        click_nav_casino(driver)
+        click_nav_casino_or_fallback(driver)
         click_lucky7_subtab(driver)
         click_first_game_in_active_pane(driver)
 
