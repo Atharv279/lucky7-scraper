@@ -41,17 +41,16 @@ jobs:
 
       - name: Run scraper (GUI via Xvfb), capture 20 rounds
         env:
-          NOH_USER: ${{ secrets.NOH_USER }}          # set in: Settings → Secrets → Actions
+          NOH_USER: ${{ secrets.NOH_USER }}          # add in Settings → Secrets → Actions
           NOH_PASS: ${{ secrets.NOH_PASS }}
           MAX_ROUNDS: "20"                            # collect at least 20 rounds per run
-          CSV_PATH: "data/lucky7_data.csv"           # output path
-          LUCKY7_PANEL_URL: ${{ vars.LUCKY7_PANEL_URL }}   # set in: Settings → Variables
         run: |
-          mkdir -p data
           xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py
 
       - name: Commit CSV changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "data: update CSV [skip ci]"
-          file_pattern: data/*.csv
+          file_pattern: |
+            lucky7_data.csv
+            data/*.csv
