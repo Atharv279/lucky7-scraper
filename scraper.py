@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Lucky 7 — Scraper (time-capped, deep-iframe, computed-style images, CI-friendly)  vA.4
+# Lucky 7 — Scraper (time-capped, deep-iframe, image+text parsers, CI-friendly)  vA.5
 
 import os, re, csv, time, random
 from datetime import datetime, timezone
@@ -54,6 +54,9 @@ def dump_debug(driver, tag="snapshot"):
 # ------------ Parsing ------------
 RANK_MAP  = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
 SUIT_KEYN = {"S":"S","H":"H","D":"D","C":"C"}
+SUIT_WORD = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}
+SUIT_SYMBOL = {"♠":"S","♥":"H","♦":"D","♣":"C"}
+
 CLOSED_HINTS = ("closed","back","backside","card-back","1_card_20_20")
 
 PAT_SIMPLE = re.compile(r"/(A|K|Q|J|10|[2-9])([SHDC])\.(?:png|jpg|jpeg|webp)\b", re.I)
@@ -61,21 +64,63 @@ PAT_DOUBLE = re.compile(r"/(A|K|Q|J|10|[2-9])(SS|HH|DD|CC)\.(?:png|jpg|jpeg|webp
 PAT_WORDY  = re.compile(r"(ace|king|queen|jack|10|[2-9]).*?(spade|heart|diamond|club)s?", re.I)
 PAT_CLASS  = re.compile(r"rank[-_ ]?(A|K|Q|J|10|[2-9]).*?suit[-_ ]?([shdc])", re.I)
 
+# Text/state fallbacks:
+PAT_SYM     = re.compile(r"\b(A|K|Q|J|10|[2-9])\s*([♠♥♦♣])", re.I)  # e.g., "8♦", "Q♠"
+PAT_OFWORD  = re.compile(r"\b(A|K|Q|J|10|[2-9])\s*(?:OF\s+)?(SPADES?|HEARTS?|DIAMONDS?|CLUBS?)\b", re.I)
+PAT_JSON_1  = re.compile(r'"rank"\s*:\s*(\d+)\s*,\s*"suit"\s*:\s*"(SPADE|HEART|DIAMOND|CLUB)"', re.I)
+PAT_JSON_2  = re.compile(r'"card"\s*:\s*"(A|K|Q|J|10|[2-9])\s*([SHDC])"', re.I)
+
+def card_from(rank_txt: str, suit_txt: str) -> Optional[Dict[str,Any]]:
+    # rank_txt can be "A"/"10"/"7"
+    # suit_txt can be "S"/"SPADE"/"♠"
+    rtxt = rank_txt.upper()
+    if rtxt not in RANK_MAP: return None
+    # suit
+    stxt = suit_txt.upper()
+    if stxt in SUIT_KEYN: s = SUIT_KEYN[stxt]
+    elif stxt in SUIT_WORD: s = SUIT_WORD[stxt]
+    elif suit_txt in SUIT_SYMBOL: s = SUIT_SYMBOL[suit_txt]
+    else: return None
+    return {"rank": RANK_MAP[rtxt], "suit_key": s}
+
 def parse_from_url(url: str) -> Optional[Dict[str, Any]]:
     low = url.lower()
     if any(h in low for h in CLOSED_HINTS): return None
     m = PAT_SIMPLE.search(url)
-    if m: r,s = m.group(1).upper(), m.group(2).upper(); return {"rank":RANK_MAP[r], "suit_key":SUIT_KEYN[s]}
+    if m: return card_from(m.group(1), m.group(2))
     m = PAT_DOUBLE.search(url)
-    if m: r,ss = m.group(1).upper(), m.group(2).upper(); return {"rank":RANK_MAP[r], "suit_key":SUIT_KEYN[ss[0]]}
+    if m: return card_from(m.group(1), m.group(2)[0])
     m = PAT_WORDY.search(url)
-    if m:
-        rtxt, stxt = m.group(1).upper(), m.group(2).upper()
-        rank = RANK_MAP[rtxt] if rtxt in RANK_MAP else int(rtxt)
-        suit = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}[stxt]
-        return {"rank":rank, "suit_key":suit}
+    if m: return card_from(m.group(1), m.group(2))
     m = PAT_CLASS.search(url)
-    if m: r,s = m.group(1).upper(), m.group(2).upper(); return {"rank":RANK_MAP[r], "suit_key":SUIT_KEYN[s]}
+    if m: return card_from(m.group(1), m.group(2))
+    return None
+
+def parse_from_text(html: str) -> Optional[Dict[str,Any]]:
+    # 1) Compact symbol form: "8♦", "Q♠"
+    m = PAT_SYM.search(html)
+    if m:
+        c = card_from(m.group(1), m.group(2))
+        if c: return c
+    # 2) "8 of diamonds"
+    m = PAT_OFWORD.search(html)
+    if m:
+        rank_raw = m.group(1).upper()
+        rank = rank_raw if rank_raw in RANK_MAP else str(int(rank_raw))  # normalize
+        suit_word = m.group(2).upper().rstrip('S')  # "DIAMONDS" → "DIAMOND"
+        c = card_from(rank, suit_word)
+        if c: return c
+    # 3) JSON state like {"rank":8,"suit":"DIAMOND"}
+    m = PAT_JSON_1.search(html)
+    if m:
+        rank_num = int(m.group(1))
+        suit_word = m.group(2).upper()
+        if rank_num in range(1,14):
+            return {"rank": rank_num, "suit_key": SUIT_WORD.get(suit_word, None) or suit_word[0]}
+    # 4) JSON like {"card":"8D"}
+    m = PAT_JSON_2.search(html)
+    if m:
+        return card_from(m.group(1), m.group(2))
     return None
 
 def result_of(rank: int) -> str:
@@ -95,17 +140,13 @@ const add = (u) => {
   out.add(s);
 };
 
-// scroll key containers into view (helps lazy loaders)
-for (const sel of [
-  'div.casino-video-cards',
-  '.flip-card-container',
-  '.video', '.web-view', '.casino-iframe-ctn'
-]) {
+// scroll likely areas (for lazy loaders)
+for (const sel of ['div.casino-video-cards','.flip-card-container','.video','.web-view','.casino-iframe-ctn']) {
   const el = document.querySelector(sel);
   if (el) el.scrollIntoView({block:'center', inline:'center'});
 }
 
-// <img> variants
+// <img>
 document.querySelectorAll('img').forEach(img => {
   add(img.getAttribute('src'));
   add(img.getAttribute('data-src'));
@@ -115,7 +156,7 @@ document.querySelectorAll('img').forEach(img => {
   for (const sv of sets) if (sv) add(sv.split(',')[0]);
 });
 
-// <source> in <picture>
+// <source>
 document.querySelectorAll('source').forEach(src => {
   const sv = src.getAttribute('srcset');
   if (sv) add(sv.split(',')[0]);
@@ -133,12 +174,10 @@ return Array.from(out);
 """
 
 def extract_candidates_js(driver) -> list[str]:
-    try:
-        return driver.execute_script(JS_COLLECT_IMAGES) or []
-    except Exception:
-        return []
+    try: return driver.execute_script(JS_COLLECT_IMAGES) or []
+    except Exception: return []
 
-# ------------ Fallback HTML scrape (page_source) ------------
+# ------------ Fallback HTML scrape ------------
 def extract_from_html(html: str) -> list[str]:
     soup = BeautifulSoup(html, "html.parser")
     urls = []
@@ -148,14 +187,13 @@ def extract_from_html(html: str) -> list[str]:
         if not u: return
         if any(h in u.lower() for h in CLOSED_HINTS): return
         if u not in urls: urls.append(u)
-
     for img in soup.find_all("img"):
         add(img.get("src")); add(img.get("data-src")); add(img.get("data-original")); add(img.get("data-lazy"))
         for attr in ("srcset","data-srcset"):
             sv = img.get(attr)
             if sv: add(sv.split(",")[0].strip())
     for src in soup.find_all("source"):
-        sv = src.get("srcset"); 
+        sv = src.get("srcset")
         if sv: add(sv.split(",")[0].strip())
     for img in soup.select("div.casino-video-cards img, div.flip-card-container img, img.open-card-image"):
         add(img.get("src"))
@@ -249,11 +287,9 @@ def click_lucky7_subtab(driver, timeout=40):
               " or contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]")
         els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
         if els: try_click(els[0]); time.sleep(1.2); return True
-        # scroll horizontal tab bars
         for cont in driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")[:3]:
             try: driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 200;}", cont)
             except Exception: pass
-        # JS text search
         try:
             clicked = bool(driver.execute_script("""
                 const U=s=>(s||'').toUpperCase();
@@ -289,7 +325,7 @@ def click_first_game_in_active_pane(driver):
     if iframes: driver.switch_to.frame(iframes[0])
     dump_debug(driver, "after_enter_game")
 
-# ------------ Helpers ------------
+# ------------ Search strategies ------------
 def find_round_id_text(driver) -> Optional[str]:
     for sel in [".round-id", ".casino-round-id", "span.roundId", "div.round-id"]:
         try:
@@ -298,32 +334,44 @@ def find_round_id_text(driver) -> Optional[str]:
         except NoSuchElementException: pass
     return None
 
-def try_parse_here(driver) -> Tuple[Optional[Dict[str,Any]], int]:
-    urls = extract_candidates_js(driver)  # JS (computed styles, lazy attrs)
-    if not urls:  # fallback to HTML parse
-        urls = extract_from_html(driver.page_source)
+def try_parse_here(driver) -> Tuple[Optional[Dict[str,Any]], int, str]:
+    # 1) JS/DOM image discovery
+    urls = extract_candidates_js(driver)
     for u in urls:
         p = parse_from_url(u)
-        if p: return p, len(urls)
-    return None, len(urls)
+        if p: return p, len(urls), f"via=url:{u[-30:]}"
+    # 2) Fallback: HTML image discovery
+    if not urls:
+        urls = extract_from_html(driver.page_source)
+        for u in urls:
+            p = parse_from_url(u)
+            if p: return p, len(urls), f"via=html:{u[-30:]}"
+    # 3) Last resort: text/JSON in DOM
+    txt_card = parse_from_text(driver.page_source)
+    if txt_card:
+        return txt_card, len(urls), "via=text"
+    return None, len(urls), ""
 
-def dfs_frames_for_card(driver, max_depth=5, depth=0) -> Tuple[Optional[Dict[str,Any]], int, int]:
-    parsed, cnt = try_parse_here(driver)
-    if parsed: return parsed, cnt, 1
-    if depth >= max_depth: return None, cnt, 0
+def dfs_frames_for_card(driver, max_depth=5, depth=0) -> Tuple[Optional[Dict[str,Any]], int, int, str]:
+    parsed, cnt, how = try_parse_here(driver)
+    if parsed: return parsed, cnt, 1, how
+    if depth >= max_depth: return None, cnt, 0, ""
     total_cnt, hits = cnt, 0
+    note = ""
     frames = driver.find_elements(By.TAG_NAME, "iframe")
     for fr in frames:
         try:
             driver.switch_to.frame(fr)
-            p, c, h = dfs_frames_for_card(driver, max_depth, depth+1)
+            p, c, h, how2 = dfs_frames_for_card(driver, max_depth, depth+1)
             total_cnt += c; hits += h
             driver.switch_to.parent_frame()
-            if p: return p, total_cnt, hits
+            if p:
+                note = how2
+                return p, total_cnt, hits, note
         except Exception:
             try: driver.switch_to.parent_frame()
             except Exception: pass
-    return None, total_cnt, hits
+    return None, total_cnt, hits, note
 
 # ------------ Main ------------
 def main():
@@ -353,30 +401,27 @@ def main():
             t0 = time.time()
             parsed = None
             total_imgs = 0
-            frames_seen = 0
+            how = ""
 
             while not parsed:
-                # Scroll key containers each pass (helps lazy loaders)
+                # Encourage lazy loaders:
                 try:
                     driver.execute_script("""
                       for (const sel of ['div.casino-video-cards','.flip-card-container','.video','.web-view']) {
                         const el = document.querySelector(sel); if (el) el.scrollIntoView({block:'center', inline:'center'});
                       }
                     """)
-                except Exception:
-                    pass
+                except Exception: pass
 
-                p, c, h = dfs_frames_for_card(driver, max_depth=5)
+                p, c, h, how = dfs_frames_for_card(driver, max_depth=5)
                 parsed, total_imgs = p, c
 
-                # heartbeat every 5s
                 now = time.time()
                 if now - last_heartbeat >= 5:
                     last_heartbeat = now
-                    # count frames at top level
-                    try: frames_seen = len(driver.find_elements(By.TAG_NAME, "iframe"))
-                    except Exception: frames_seen = -1
-                    print(f"⏳ Waiting… imgs={total_imgs} frames(top)={frames_seen} elapsed={int(elapsed)}s", flush=True)
+                    try: frames_top = len(driver.find_elements(By.TAG_NAME, "iframe"))
+                    except Exception: frames_top = -1
+                    print(f"⏳ Waiting… imgs={total_imgs} frames(top)={frames_top} elapsed={int(elapsed)}s", flush=True)
                     dump_debug(driver, f"wait_{int(elapsed)}s")
 
                 if parsed: break
@@ -392,7 +437,7 @@ def main():
             rid = find_round_id_text(driver)
             rank, suit = parsed["rank"], parsed["suit_key"]
             color = "red" if suit in ("H","D") else "black"
-            res = result_of(rank)
+            res = "seven" if rank==7 else ("below7" if rank<7 else "above7")
             row = {
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
                 "round_id": rid, "rank": rank, "suit_key": suit,
@@ -405,7 +450,7 @@ def main():
             last_sig = sig
 
             append_row(CSV_PATH, row)
-            print(f"✅ Round {round_num}: {rank}{suit} → {res}", flush=True)
+            print(f"✅ Round {round_num}: {rank}{suit} → {res} ({how})", flush=True)
             saved += 1
 
             if (MAX_ROUNDS and saved >= MAX_ROUNDS) or (RUN_SECONDS and (time.time() - start_ts >= RUN_SECONDS)):
