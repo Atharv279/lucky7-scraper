@@ -1,15 +1,19 @@
-name: Lucky7 Scraper (every 20 min)
+name: Lucky7 Scraper (near-24/7)
 
 on:
   schedule:
-    - cron: "*/20 * * * *"    # run every 20 minutes
-  workflow_dispatch: {}        # allow manual runs
+    - cron: "*/5 * * * *"   # trigger every 5 minutes
+  workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
+    timeout-minutes: 55             # allow this run to last ~50-55 minutes
+    concurrency:
+      group: lucky7-scrape          # queue runs; no overlap
+      cancel-in-progress: false
     permissions:
-      contents: write          # needed to commit CSV back to the repo
+      contents: write
 
     steps:
       - name: Checkout repo
@@ -39,11 +43,12 @@ jobs:
             pip install selenium webdriver-manager beautifulsoup4
           fi
 
-      - name: Run scraper (GUI via Xvfb), capture 20 rounds
+      - name: Run scraper (GUI via Xvfb) ~50 minutes
         env:
-          NOH_USER: ${{ secrets.NOH_USER }}   # add these in Settings → Secrets → Actions
+          NOH_USER: ${{ secrets.NOH_USER }}     # set in: Settings → Secrets → Actions
           NOH_PASS: ${{ secrets.NOH_PASS }}
-          MAX_ROUNDS: "20"
+          RUN_SECONDS: "3000"                   # ~50 minutes per run
+          MAX_ROUNDS: "0"                       # 0 = ignore round cap (time-based)
           CSV_PATH: "lucky7_data.csv"
         run: |
           xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py
