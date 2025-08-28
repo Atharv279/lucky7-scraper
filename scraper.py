@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Lucky 7 — Single-File Scraper (strict click flow, non-headless)  v3.3
+Lucky 7 — Single-File Scraper (time-capped run, non-headless)  vA.1
 
 Flow (no direct URLs):
-  Login → click "Casino" → click "Lucky 7" tab → click first game tile → enter iframe → scrape N rounds → exit.
+  Login → click "Casino" → click "Lucky 7" tab → click first game tile → enter iframe → scrape → exit.
 
 CSV columns (clean):
   ts_utc, round_id, rank, suit_key, color, result
 
+Run-duration control:
+  - RUN_SECONDS: total seconds to keep scraping this run (default ~50 min = 3000s)
+  - MAX_ROUNDS:  set 0 to ignore round cap (default 0); or set to e.g. 20 to cap by rounds too
+
 Notes:
-- Non-headless (CI will run it with Xvfb), do NOT add --headless.
-- Stops after MAX_ROUNDS saved rows (default 20) so GitHub Action can finish.
-- Uses only env creds (NOH_USER/NOH_PASS) — no hardcoded passwords.
+  - Non-headless. In CI use Xvfb: `xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py`
+  - Credentials must be provided via env: NOH_USER / NOH_PASS
 """
 
 import os, re, csv, time, random
@@ -36,12 +39,14 @@ PASSWORD      = os.getenv("NOH_PASS")
 if not USERNAME or not PASSWORD:
     raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
-CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")  # keep root path as in your local setup
+CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")  # keep root path (your local style)
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.2"))
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
-MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "20"))        # collect this many rows per run (saved rows)
+RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))     # ~50 minutes per run
+MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))         # 0 = ignore round cap; else cap by saved rows
 
-VISIBLE_BROWSER = True  # run non-headless; CI uses Xvfb to provide a virtual screen
+# Non-headless; CI wraps with Xvfb to provide a virtual display
+VISIBLE_BROWSER = True
 
 # ===================== CSV helpers =====================
 HEADERS = ["ts_utc", "round_id", "rank", "suit_key", "color", "result"]
@@ -99,15 +104,11 @@ def extract_card_img_urls(html: str) -> list[str]:
     """Prefer the revealed/open card image; skip closed/back placeholders."""
     soup = BeautifulSoup(html, "html.parser")
     urls: list[str] = []
-
     queries = [
-        # Lucky-7 flip-card back → usually the open face when flipped
         "div.casino-video-cards div.flip-card-back img",
         "div.flip-card-inner div.flip-card-back img",
-        # Common open-card classes
         "div.lucky7-open img",
         "img.open-card-image",
-        # Fallbacks
         "div.casino-video-cards img",
         "div.flip-card-container img",
     ]
@@ -120,7 +121,6 @@ def extract_card_img_urls(html: str) -> list[str]:
             if any(h in src.lower() for h in CLOSED_HINTS): continue
             if src not in urls:
                 urls.append(src)
-
     # final sweep
     for img in soup.find_all("img"):
         src = (img.get("src") or "").strip()
@@ -130,7 +130,6 @@ def extract_card_img_urls(html: str) -> list[str]:
         if "/img/cards/" in low or "card" in low:
             if src not in urls:
                 urls.append(src)
-
     return urls
 
 # ===================== Selenium helpers =====================
@@ -174,9 +173,7 @@ def login_same_site(driver):
     time.sleep(2.0)
 
 def click_nav_casino(driver, timeout=45):
-    """
-    Robust 'Casino' click: handles hamburger menus, text & href locators, and JS fallback.
-    """
+    """Robust 'Casino' click: handles hamburger menus, text & href locators, and JS fallback."""
     def try_click(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
         time.sleep(0.2)
@@ -199,7 +196,6 @@ def click_nav_casino(driver, timeout=45):
                     time.sleep(0.6)
                 except Exception:
                     pass
-
         # Try text & href locators
         xpaths = [
             "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
@@ -214,7 +210,6 @@ def click_nav_casino(driver, timeout=45):
                 try_click(els[0])
                 time.sleep(1.5)
                 return
-
         # JS fallback
         try:
             clicked = bool(driver.execute_script("""
@@ -228,14 +223,11 @@ def click_nav_casino(driver, timeout=45):
             clicked = False
         if clicked:
             time.sleep(1.5); return
-
         time.sleep(0.5)
     raise TimeoutException("Casino link not found")
 
 def click_lucky7_subtab(driver, timeout=40):
-    """
-    Robust 'Lucky 7' tab open: searches a/button/div/span/li, handles overflow tab bars, JS fallback.
-    """
+    """Robust 'Lucky 7' tab open: searches a/button/div/span/li, handles overflow tab bars, JS fallback."""
     def try_click(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
         time.sleep(0.2)
@@ -278,14 +270,11 @@ def click_lucky7_subtab(driver, timeout=40):
             time.sleep(1.2); return True
 
         time.sleep(0.5)
-
     # Final fallback: proceed; some pages already open the Lucky7 pane by default
     return False
 
 def click_first_game_in_active_pane(driver):
-    """
-    Click the first game tile in the active Lucky7 pane (tile parent node), then switch to game window and iframe.
-    """
+    """Click the first game tile (parent node), switch to game window and iframe."""
     try:
         pane = W(driver, EC.visibility_of_element_located((
             By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]"
@@ -304,11 +293,9 @@ def click_first_game_in_active_pane(driver):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     time.sleep(0.2); safe_click(driver, target)
     time.sleep(0.8)
-
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
     time.sleep(2.0)
-
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     if iframes:
         driver.switch_to.frame(iframes[0])
@@ -339,11 +326,17 @@ def main():
         click_first_game_in_active_pane(driver)
         print("✅ Entered Lucky 7 game")
 
+        start_ts = time.time()
         last_sig = None
         saved = 0
         round_num = 1
 
         while True:
+            # Bail out on time cap even if we haven't saved yet (prevents stuck runs)
+            if RUN_SECONDS and (time.time() - start_ts >= RUN_SECONDS):
+                print(f"⏱️ Time cap reached ({int(time.time()-start_ts)}s). Saved {saved} rounds.")
+                break
+
             t0 = time.time()
             parsed = None
 
@@ -410,8 +403,10 @@ def main():
             append_row(CSV_PATH, row)
             print(f"✅ Round {round_num}: {rank}{suit} → {res}")
             saved += 1
-            if MAX_ROUNDS and saved >= MAX_ROUNDS:
-                print(f"🏁 Done — captured {saved} rounds.")
+
+            # Stop on round cap OR time cap
+            if (MAX_ROUNDS and saved >= MAX_ROUNDS) or (RUN_SECONDS and (time.time() - start_ts >= RUN_SECONDS)):
+                print(f"🏁 Done — captured {saved} rounds in {int(time.time()-start_ts)}s.")
                 break
 
             round_num += 1
