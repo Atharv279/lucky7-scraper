@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
 """
-Lucky 7 — Single-File Scraper (time-capped run, non-headless)  vA.1
+Lucky 7 — Scraper (time-capped, non-headless, CI-friendly)  vA.2
 
-Flow (no direct URLs):
-  Login → click "Casino" → click "Lucky 7" tab → click first game tile → enter iframe → scrape → exit.
+Flow:
+  Login → click "Casino" → click "Lucky 7" tab → click first game tile → enter iframe → scrape until time/round cap → exit.
 
 CSV columns (clean):
   ts_utc, round_id, rank, suit_key, color, result
 
 Run-duration control:
-  - RUN_SECONDS: total seconds to keep scraping this run (default ~50 min = 3000s)
-  - MAX_ROUNDS:  set 0 to ignore round cap (default 0); or set to e.g. 20 to cap by rounds too
-
-Notes:
-  - Non-headless. In CI use Xvfb: `xvfb-run -a -s "-screen 0 1600x900x24" python scraper.py`
-  - Credentials must be provided via env: NOH_USER / NOH_PASS
+  RUN_SECONDS  (default 3000s ≈ 50 min)
+  MAX_ROUNDS   (default 0 = ignore round cap; set to e.g. 20 to limit by rows too)
 """
 
 import os, re, csv, time, random
@@ -39,11 +35,11 @@ PASSWORD      = os.getenv("NOH_PASS")
 if not USERNAME or not PASSWORD:
     raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
-CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")  # keep root path (your local style)
+CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")  # keep root path
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.2"))
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
 RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))     # ~50 minutes per run
-MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))         # 0 = ignore round cap; else cap by saved rows
+MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))         # 0 = ignore round cap
 
 # Non-headless; CI wraps with Xvfb to provide a virtual display
 VISIBLE_BROWSER = True
@@ -60,14 +56,27 @@ def append_row(path: str, row: Dict[str, Any]):
     with open(path, "a", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=HEADERS).writerow({k: row.get(k) for k in HEADERS})
 
+# ===================== Debug snapshots =====================
+def dump_debug(driver, tag="snapshot"):
+    try:
+        os.makedirs("debug", exist_ok=True)
+        with open(f"debug/{tag}.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        try:
+            driver.save_screenshot(f"debug/{tag}.png")
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 # ===================== Card parsing =====================
 RANK_MAP  = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
 SUIT_KEYN = {"S":"S","H":"H","D":"D","C":"C"}
 
-PAT_SIMPLE = re.compile(r"/(A|K|Q|J|10|[2-9])([SHDC])\.(?:png|jpg|jpeg|webp)\b", re.I)        # /7D.png
-PAT_DOUBLE = re.compile(r"/(A|K|Q|J|10|[2-9])(SS|HH|DD|CC)\.(?:png|jpg|jpeg|webp)\b", re.I)    # /10CC.webp → C
-PAT_WORDY  = re.compile(r"(ace|king|queen|jack|10|[2-9]).*?(spade|heart|diamond|club)s?", re.I)# queen_of_spades.png
-PAT_CLASS  = re.compile(r"rank[-_ ]?(A|K|Q|J|10|[2-9]).*?suit[-_ ]?([shdc])", re.I)            # rank-7 suit-h
+PAT_SIMPLE = re.compile(r"/(A|K|Q|J|10|[2-9])([SHDC])\.(?:png|jpg|jpeg|webp)\b", re.I)
+PAT_DOUBLE = re.compile(r"/(A|K|Q|J|10|[2-9])(SS|HH|DD|CC)\.(?:png|jpg|jpeg|webp)\b", re.I)
+PAT_WORDY  = re.compile(r"(ace|king|queen|jack|10|[2-9]).*?(spade|heart|diamond|club)s?", re.I)
+PAT_CLASS  = re.compile(r"rank[-_ ]?(A|K|Q|J|10|[2-9]).*?suit[-_ ]?([shdc])", re.I)
 CLOSED_HINTS = ("closed", "back", "backside", "card-back", "1_card_20_20")
 
 def parse_from_url(url: str) -> Optional[Dict[str, int | str]]:
@@ -101,7 +110,6 @@ def result_of(rank: int) -> str:
 
 # ===================== Extract open card image(s) =====================
 def extract_card_img_urls(html: str) -> list[str]:
-    """Prefer the revealed/open card image; skip closed/back placeholders."""
     soup = BeautifulSoup(html, "html.parser")
     urls: list[str] = []
     queries = [
@@ -121,7 +129,6 @@ def extract_card_img_urls(html: str) -> list[str]:
             if any(h in src.lower() for h in CLOSED_HINTS): continue
             if src not in urls:
                 urls.append(src)
-    # final sweep
     for img in soup.find_all("img"):
         src = (img.get("src") or "").strip()
         if not src: continue
@@ -167,10 +174,11 @@ def login_same_site(driver):
         user_input.clear(); user_input.send_keys(USERNAME)
         pass_input.clear(); pass_input.send_keys(PASSWORD)
         pass_input.submit()
-        print("✅ Logged in")
+        print("✅ Logged in", flush=True)
     except NoSuchElementException:
-        print("⚠️ Login inputs not found; maybe already logged in")
+        print("⚠️ Login inputs not found; maybe already logged in", flush=True)
     time.sleep(2.0)
+    dump_debug(driver, "after_login")
 
 def click_nav_casino(driver, timeout=45):
     """Robust 'Casino' click: handles hamburger menus, text & href locators, and JS fallback."""
@@ -184,7 +192,6 @@ def click_nav_casino(driver, timeout=45):
 
     end = time.time() + timeout
     while time.time() < end:
-        # Open hamburger/toggler if present
         togglers = driver.find_elements(
             By.XPATH,
             "//button[contains(@class,'navbar-toggler') or contains(@class,'hamburger') or contains(@class,'menu') or @aria-label='Toggle navigation']"
@@ -196,7 +203,6 @@ def click_nav_casino(driver, timeout=45):
                     time.sleep(0.6)
                 except Exception:
                     pass
-        # Try text & href locators
         xpaths = [
             "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
             "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
@@ -210,7 +216,6 @@ def click_nav_casino(driver, timeout=45):
                 try_click(els[0])
                 time.sleep(1.5)
                 return
-        # JS fallback
         try:
             clicked = bool(driver.execute_script("""
                 const U=s=> (s||'').toUpperCase();
@@ -227,7 +232,7 @@ def click_nav_casino(driver, timeout=45):
     raise TimeoutException("Casino link not found")
 
 def click_lucky7_subtab(driver, timeout=40):
-    """Robust 'Lucky 7' tab open: searches a/button/div/span/li, handles overflow tab bars, JS fallback."""
+    """Robust 'Lucky 7' tab: searches a/button/div/span/li, handles overflow tab bars, JS fallback."""
     def try_click(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
         time.sleep(0.2)
@@ -246,16 +251,12 @@ def click_lucky7_subtab(driver, timeout=40):
             try_click(els[0])
             time.sleep(1.2)
             return True
-
-        # Horizontal nudge on likely tab containers
         tab_conts = driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")
         for cont in tab_conts[:3]:
             try:
                 driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 200;}", cont)
             except Exception:
                 pass
-
-        # JS text-search fallback
         try:
             clicked = bool(driver.execute_script("""
                 const U=s=>(s||'').toUpperCase();
@@ -268,10 +269,8 @@ def click_lucky7_subtab(driver, timeout=40):
             clicked = False
         if clicked:
             time.sleep(1.2); return True
-
         time.sleep(0.5)
-    # Final fallback: proceed; some pages already open the Lucky7 pane by default
-    return False
+    return False  # some pages already land in Lucky7 pane
 
 def click_first_game_in_active_pane(driver):
     """Click the first game tile (parent node), switch to game window and iframe."""
@@ -299,6 +298,7 @@ def click_first_game_in_active_pane(driver):
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     if iframes:
         driver.switch_to.frame(iframes[0])
+    dump_debug(driver, "after_enter_game")
 
 # ===================== Round helpers =====================
 def find_round_id_text(driver) -> Optional[str]:
@@ -313,18 +313,18 @@ def find_round_id_text(driver) -> Optional[str]:
 
 # ===================== Main =====================
 def main():
-    print(f"📊 CSV → {CSV_PATH}")
+    print(f"📊 CSV → {CSV_PATH}", flush=True)
     driver = make_driver()
     ensure_csv(CSV_PATH)
 
     try:
-        # Login + strict click navigation (no direct URL shortcuts)
+        # Login + strict click navigation
         login_same_site(driver)
         W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 30)
         click_nav_casino(driver)
         click_lucky7_subtab(driver)
         click_first_game_in_active_pane(driver)
-        print("✅ Entered Lucky 7 game")
+        print("✅ Entered Lucky 7 game", flush=True)
 
         start_ts = time.time()
         last_sig = None
@@ -332,9 +332,8 @@ def main():
         round_num = 1
 
         while True:
-            # Bail out on time cap even if we haven't saved yet (prevents stuck runs)
             if RUN_SECONDS and (time.time() - start_ts >= RUN_SECONDS):
-                print(f"⏱️ Time cap reached ({int(time.time()-start_ts)}s). Saved {saved} rounds.")
+                print(f"⏱️ Time cap reached ({int(time.time()-start_ts)}s). Saved {saved} rounds.", flush=True)
                 break
 
             t0 = time.time()
@@ -401,20 +400,24 @@ def main():
             last_sig = sig
 
             append_row(CSV_PATH, row)
-            print(f"✅ Round {round_num}: {rank}{suit} → {res}")
+            print(f"✅ Round {round_num}: {rank}{suit} → {res}", flush=True)
             saved += 1
 
-            # Stop on round cap OR time cap
+            # Stop on round or time cap
             if (MAX_ROUNDS and saved >= MAX_ROUNDS) or (RUN_SECONDS and (time.time() - start_ts >= RUN_SECONDS)):
-                print(f"🏁 Done — captured {saved} rounds in {int(time.time()-start_ts)}s.")
+                print(f"🏁 Done — captured {saved} rounds in {int(time.time()-start_ts)}s.", flush=True)
                 break
 
             round_num += 1
             time.sleep(POLL_SEC)
 
     except KeyboardInterrupt:
-        print("🛑 Stopped by user")
+        print("🛑 Stopped by user", flush=True)
     finally:
+        if saved == 0:
+            dump_debug(driver, "no_data_end")
+            with open("debug/NO_DATA.txt","w",encoding="utf-8") as f:
+                f.write("Scraper saved 0 rounds this run.")
         try: driver.quit()
         except Exception: pass
 
