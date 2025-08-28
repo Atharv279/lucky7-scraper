@@ -147,10 +147,88 @@ def login_same_site(driver):
     except NoSuchElementException:
         print("⚠️ Login inputs not found; maybe already logged in")
 
-def click_nav_casino(driver):
-    el = W(driver, EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/casino/99998') or contains(., 'Casino')]")))
-    safe_click(driver, el)
-    time.sleep(2)
+def click_nav_casino(driver, timeout=45):
+    """
+    Robustly click the 'Casino' navigation:
+    - Opens hamburger/toggler menus if present
+    - Tries multiple XPath strategies (text and href contains 'casino')
+    - Falls back to JS text search
+    """
+    def try_click(el):
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        time.sleep(0.2)
+        try:
+            el.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", el)
+
+    end = time.time() + timeout
+    last_url = driver.current_url
+
+    while time.time() < end:
+        # 1) Try to open nav/hamburger/toggler if present
+        togglers = driver.find_elements(
+            By.XPATH,
+            "//button[contains(@class,'navbar-toggler') or contains(@class,'hamburger') or contains(@class,'menu') or @aria-label='Toggle navigation']"
+        )
+        for tog in togglers[:2]:
+            if tog.is_displayed():
+                try:
+                    try_click(tog)
+                    time.sleep(0.6)
+                except Exception:
+                    pass
+
+        # 2) Try several likely locators
+        xpaths = [
+            # Text-based
+            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
+            "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
+            "//div[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
+            # Href-based (more generic than /casino/99998)
+            "//a[contains(@href, '/casino')]",
+            "//a[contains(@href, 'casino')]",
+        ]
+        for xp in xpaths:
+            els = driver.find_elements(By.XPATH, xp)
+            for el in els:
+                if not el.is_displayed():
+                    continue
+                try_click(el)
+                # Wait briefly for either URL to include 'casino' or for Lucky 7 tab to appear
+                try:
+                    WebDriverWait(driver, 5).until(
+                        lambda d: ("casino" in d.current_url.lower())
+                        or d.find_elements(
+                            By.XPATH,
+                            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY 7') or "
+                            "contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]"
+                        )
+                    )
+                except Exception:
+                    pass
+                return
+
+        # 3) JS text-search fallback
+        clicked = False
+        try:
+            clicked = bool(driver.execute_script("""
+                const els = Array.from(document.querySelectorAll('a,button,div,span'));
+                const el = els.find(e => (e.innerText || e.textContent || '').toUpperCase().includes('CASINO'));
+                if (el) { el.scrollIntoView({block:'center', inline:'center'}); el.click(); return true; }
+                return false;
+            """))
+        except Exception:
+            clicked = False
+
+        if clicked:
+            time.sleep(1.5)
+            return
+
+        time.sleep(0.5)
+
+    raise TimeoutException("Casino link not found after waiting.")
+
 
 def click_lucky7_subtab(driver):
     # 'Lucky 7' or 'Lucky7' (case-insensitive)
