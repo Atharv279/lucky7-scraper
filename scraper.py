@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Lucky7 Panel Scraper — single file, simple, same site/login — v1.0
+Lucky 7 — Single-File Scraper (strict click flow, non-headless)  v3.3
 
-- Logs in to the SAME site (nohmy99) using the same credentials.
-- Clicks: Casino → Lucky 7 tab → FIRST game tile in that panel.
-- In the game window, watches for the single revealed card each round.
-- Appends rows to CSV with derived features (Below7/Seven/Above7, Odd/Even, Red/Black).
-- Minimal dedupe: skips if same round_id (when present) or same (rank+suit) seen consecutively.
+Flow (no direct URLs):
+  Login → click "Casino" → click "Lucky 7" tab → click first game tile → enter iframe → scrape N rounds → exit.
 
-Dependencies:
-  pip install selenium webdriver-manager beautifulsoup4
+CSV columns (clean):
+  ts_utc, round_id, rank, suit_key, color, result
 
-Run:
-  python lucky7_samepanel_scraper.py
-Stop:
-  Ctrl + C
+Notes:
+- Non-headless (CI will run it with Xvfb), do NOT add --headless.
+- Stops after MAX_ROUNDS saved rows (default 20) so GitHub Action can finish.
+- Uses only env creds (NOH_USER/NOH_PASS) — no hardcoded passwords.
 """
 
-import os, re, csv, time, sys
+import os, re, csv, time, random
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
-from collections import OrderedDict
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
@@ -30,92 +26,121 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ===================== CONFIG (same site + login) =====================
-URL          = "https://nohmy99.vip/home"
-USERNAME     = os.getenv("NOH_USER", "7558714781")      # same as your DT script
-PASSWORD     = os.getenv("NOH_PASS", "Atharv@1204")     # same as your DT script
-CSV_PATH     = "lucky7_data.csv"
-POLL_SEC     = 2.0
-ROUND_TIMEOUT= 90
-MAX_ROUNDS = int(os.getenv('MAX_ROUNDS', '20'))  # stop after saving this many rounds per run
+# ===================== REQUIRED ENVs & CONFIG =====================
+URL           = os.getenv("LUCKY7_URL", "https://nohmy99.vip/home")
+USERNAME      = os.getenv("NOH_USER")
+PASSWORD      = os.getenv("NOH_PASS")
+if not USERNAME or not PASSWORD:
+    raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
-VISIBLE_BROWSER = True   # keep it visible like your previous script (set False for headless)
+CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")  # keep root path as in your local setup
+POLL_SEC      = float(os.getenv("POLL_SEC", "1.2"))
+ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
+MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "20"))        # collect this many rows per run (saved rows)
 
-# ===================== Helpers & Parsing =====================
-HEADERS = [
-    "ts_utc","round_id","rank","suit_key","color",
-    "is_odd","is_even","is_red","is_black",
-    "cat_below7","cat_seven","cat_above7"
-]
+VISIBLE_BROWSER = True  # run non-headless; CI uses Xvfb to provide a virtual screen
 
-SUIT_MAP = {
-    "S": {"key": "S", "symbol": "♠", "color": "black"},
-    "H": {"key": "H", "symbol": "♥", "color": "red"},
-    "D": {"key": "D", "symbol": "♦", "color": "red"},
-    "C": {"key": "C", "symbol": "♣", "color": "black"},
-    # names
-    "SPADES":  {"key": "S", "symbol": "♠", "color": "black"},
-    "HEARTS":  {"key": "H", "symbol": "♥", "color": "red"},
-    "DIAMONDS":{"key": "D", "symbol": "♦", "color": "red"},
-    "CLUBS":   {"key": "C", "symbol": "♣", "color": "black"},
-    # symbols direct
-    "♠": {"key": "S", "symbol": "♠", "color": "black"},
-    "♥": {"key": "H", "symbol": "♥", "color": "red"},
-    "♦": {"key": "D", "symbol": "♦", "color": "red"},
-    "♣": {"key": "C", "symbol": "♣", "color": "black"},
-}
-RANK_MAP = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
+# ===================== CSV helpers =====================
+HEADERS = ["ts_utc", "round_id", "rank", "suit_key", "color", "result"]
 
-def parse_rank(text: str) -> Optional[int]:
-    if not text: return None
-    t = text.strip().upper()
-    if t in RANK_MAP: return RANK_MAP[t]
-    m = re.search(r"(10|[2-9])", t)
-    if m: return int(m.group(1))
-    for k in ("A","J","Q","K"):
-        if k in t: return RANK_MAP[k]
+def ensure_csv(path: str):
+    if not os.path.exists(path):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.DictWriter(f, fieldnames=HEADERS).writeheader()
+
+def append_row(path: str, row: Dict[str, Any]):
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.DictWriter(f, fieldnames=HEADERS).writerow({k: row.get(k) for k in HEADERS})
+
+# ===================== Card parsing =====================
+RANK_MAP  = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
+SUIT_KEYN = {"S":"S","H":"H","D":"D","C":"C"}
+
+PAT_SIMPLE = re.compile(r"/(A|K|Q|J|10|[2-9])([SHDC])\.(?:png|jpg|jpeg|webp)\b", re.I)        # /7D.png
+PAT_DOUBLE = re.compile(r"/(A|K|Q|J|10|[2-9])(SS|HH|DD|CC)\.(?:png|jpg|jpeg|webp)\b", re.I)    # /10CC.webp → C
+PAT_WORDY  = re.compile(r"(ace|king|queen|jack|10|[2-9]).*?(spade|heart|diamond|club)s?", re.I)# queen_of_spades.png
+PAT_CLASS  = re.compile(r"rank[-_ ]?(A|K|Q|J|10|[2-9]).*?suit[-_ ]?([shdc])", re.I)            # rank-7 suit-h
+CLOSED_HINTS = ("closed", "back", "backside", "card-back", "1_card_20_20")
+
+def parse_from_url(url: str) -> Optional[Dict[str, int | str]]:
+    low = url.lower()
+    if any(h in low for h in CLOSED_HINTS):
+        return None
+    m = PAT_SIMPLE.search(url)
+    if m:
+        r, s = m.group(1).upper(), m.group(2).upper()
+        return {"rank": RANK_MAP[r], "suit_key": SUIT_KEYN[s]}
+    m = PAT_DOUBLE.search(url)
+    if m:
+        r, ss = m.group(1).upper(), m.group(2).upper()
+        return {"rank": RANK_MAP[r], "suit_key": SUIT_KEYN[ss[0]]}
+    m = PAT_WORDY.search(url)
+    if m:
+        rtxt, stxt = m.group(1).upper(), m.group(2).upper()
+        rank = RANK_MAP[rtxt] if rtxt in RANK_MAP else int(rtxt)
+        suit = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}[stxt]
+        return {"rank": rank, "suit_key": suit}
+    m = PAT_CLASS.search(url)
+    if m:
+        r, s = m.group(1).upper(), m.group(2).upper()
+        return {"rank": RANK_MAP[r], "suit_key": SUIT_KEYN[s]}
     return None
 
-def parse_suit(text: str) -> Optional[Dict[str,str]]:
-    if not text: return None
-    t = text.strip().upper()
-    # normalize words
-    t = t.replace("SPADE","SPADES").replace("HEART","HEARTS").replace("DIAMOND","DIAMONDS").replace("CLUB","CLUBS")
-    # symbol direct
-    for sym in ("♠","♥","♦","♣"):
-        if sym in text: return SUIT_MAP[sym]
-    if t in SUIT_MAP: return SUIT_MAP[t]
-    # search for any word hit
-    for name in ("SPADES","HEARTS","DIAMONDS","CLUBS"):
-        if name in t: return SUIT_MAP[name]
-    return None
+def result_of(rank: int) -> str:
+    if rank < 7: return "below7"
+    if rank == 7: return "seven"
+    return "above7"
 
-def derive_features(rank: int, suit_key: str) -> Dict[str, Any]:
-    suit_key = suit_key.upper()
-    color = "red" if suit_key in ("H","D") else "black"
-    return {
-        "color": color,
-        "is_odd": rank % 2 == 1,
-        "is_even": rank % 2 == 0,
-        "cat_below7": rank < 7,
-        "cat_seven": rank == 7,
-        "cat_above7": rank > 7,
-        "is_red": color == "red",
-        "is_black": color == "black",
-    }
+# ===================== Extract open card image(s) =====================
+def extract_card_img_urls(html: str) -> list[str]:
+    """Prefer the revealed/open card image; skip closed/back placeholders."""
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
 
-# ===================== Selenium Boot =====================
+    queries = [
+        # Lucky-7 flip-card back → usually the open face when flipped
+        "div.casino-video-cards div.flip-card-back img",
+        "div.flip-card-inner div.flip-card-back img",
+        # Common open-card classes
+        "div.lucky7-open img",
+        "img.open-card-image",
+        # Fallbacks
+        "div.casino-video-cards img",
+        "div.flip-card-container img",
+    ]
+    for q in queries:
+        for img in soup.select(q):
+            src = (img.get("src") or "").strip()
+            alt = (img.get("alt") or "").strip().lower()
+            if not src: continue
+            if alt == "closed": continue
+            if any(h in src.lower() for h in CLOSED_HINTS): continue
+            if src not in urls:
+                urls.append(src)
+
+    # final sweep
+    for img in soup.find_all("img"):
+        src = (img.get("src") or "").strip()
+        if not src: continue
+        low = src.lower()
+        if any(h in low for h in CLOSED_HINTS): continue
+        if "/img/cards/" in low or "card" in low:
+            if src not in urls:
+                urls.append(src)
+
+    return urls
+
+# ===================== Selenium helpers =====================
 def make_driver():
     opts = Options()
-    if not VISIBLE_BROWSER:
-        opts.add_argument("--headless=new")
+    # Non-headless; CI wraps with Xvfb
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1600,900")
-    opts.add_argument("--blink-settings=imagesEnabled=false")
     opts.add_argument("--log-level=3")
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
@@ -124,19 +149,19 @@ def W(driver, cond, timeout=15):
 
 def safe_click(driver, el):
     try:
-        el.click()
+        ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
     except Exception:
         driver.execute_script("arguments[0].click();", el)
 
-# ===================== Site Navigation (same style, Lucky 7) =====================
+# ===================== Navigation (strict click path) =====================
 def login_same_site(driver):
     driver.get(URL)
-    time.sleep(2)
-    # click Login link
+    time.sleep(2.5)
+    # Click 'Login' if visible
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(1.5)
+    time.sleep(1.0)
     try:
         user_input = driver.find_element(By.XPATH, "//input[@name='User Name']")
         pass_input = driver.find_element(By.XPATH, "//input[@name='Password']")
@@ -146,13 +171,11 @@ def login_same_site(driver):
         print("✅ Logged in")
     except NoSuchElementException:
         print("⚠️ Login inputs not found; maybe already logged in")
+    time.sleep(2.0)
 
 def click_nav_casino(driver, timeout=45):
     """
-    Robustly click the 'Casino' navigation:
-    - Opens hamburger/toggler menus if present
-    - Tries multiple XPath strategies (text and href contains 'casino')
-    - Falls back to JS text search
+    Robust 'Casino' click: handles hamburger menus, text & href locators, and JS fallback.
     """
     def try_click(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
@@ -163,10 +186,8 @@ def click_nav_casino(driver, timeout=45):
             driver.execute_script("arguments[0].click();", el)
 
     end = time.time() + timeout
-    last_url = driver.current_url
-
     while time.time() < end:
-        # 1) Try to open nav/hamburger/toggler if present
+        # Open hamburger/toggler if present
         togglers = driver.find_elements(
             By.XPATH,
             "//button[contains(@class,'navbar-toggler') or contains(@class,'hamburger') or contains(@class,'menu') or @aria-label='Toggle navigation']"
@@ -179,270 +200,228 @@ def click_nav_casino(driver, timeout=45):
                 except Exception:
                     pass
 
-        # 2) Try several likely locators
+        # Try text & href locators
         xpaths = [
-            # Text-based
             "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
             "//button[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
             "//div[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
-            # Href-based (more generic than /casino/99998)
             "//a[contains(@href, '/casino')]",
             "//a[contains(@href, 'casino')]",
         ]
         for xp in xpaths:
-            els = driver.find_elements(By.XPATH, xp)
-            for el in els:
-                if not el.is_displayed():
-                    continue
-                try_click(el)
-                # Wait briefly for either URL to include 'casino' or for Lucky 7 tab to appear
-                try:
-                    WebDriverWait(driver, 5).until(
-                        lambda d: ("casino" in d.current_url.lower())
-                        or d.find_elements(
-                            By.XPATH,
-                            "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY 7') or "
-                            "contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]"
-                        )
-                    )
-                except Exception:
-                    pass
+            els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
+            if els:
+                try_click(els[0])
+                time.sleep(1.5)
                 return
 
-        # 3) JS text-search fallback
-        clicked = False
+        # JS fallback
         try:
             clicked = bool(driver.execute_script("""
-                const els = Array.from(document.querySelectorAll('a,button,div,span'));
-                const el = els.find(e => (e.innerText || e.textContent || '').toUpperCase().includes('CASINO'));
-                if (el) { el.scrollIntoView({block:'center', inline:'center'}); el.click(); return true; }
+                const U=s=> (s||'').toUpperCase();
+                const els=[...document.querySelectorAll('a,button,div,span')];
+                const el = els.find(e => U(e.innerText||e.textContent).includes('CASINO'));
+                if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
                 return false;
             """))
         except Exception:
             clicked = False
-
         if clicked:
-            time.sleep(1.5)
-            return
+            time.sleep(1.5); return
+
+        time.sleep(0.5)
+    raise TimeoutException("Casino link not found")
+
+def click_lucky7_subtab(driver, timeout=40):
+    """
+    Robust 'Lucky 7' tab open: searches a/button/div/span/li, handles overflow tab bars, JS fallback.
+    """
+    def try_click(el):
+        driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
+        time.sleep(0.2)
+        try:
+            el.click()
+        except Exception:
+            driver.execute_script("arguments[0].click();", el)
+
+    end = time.time() + timeout
+    while time.time() < end:
+        xp = ("//*[self::a or self::button or self::div or self::span or self::li]"
+              "[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY 7') "
+              " or contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]")
+        els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
+        if els:
+            try_click(els[0])
+            time.sleep(1.2)
+            return True
+
+        # Horizontal nudge on likely tab containers
+        tab_conts = driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")
+        for cont in tab_conts[:3]:
+            try:
+                driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 200;}", cont)
+            except Exception:
+                pass
+
+        # JS text-search fallback
+        try:
+            clicked = bool(driver.execute_script("""
+                const U=s=>(s||'').toUpperCase();
+                const els=[...document.querySelectorAll('a,button,div,span,li')];
+                const el = els.find(e => { const t=U(e.innerText||e.textContent); return t.includes('LUCKY 7')||t.includes('LUCKY7');});
+                if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
+                return false;
+            """))
+        except Exception:
+            clicked = False
+        if clicked:
+            time.sleep(1.2); return True
 
         time.sleep(0.5)
 
-    raise TimeoutException("Casino link not found after waiting.")
-
-
-def click_lucky7_subtab(driver):
-    # 'Lucky 7' or 'Lucky7' (case-insensitive)
-    el = W(driver, EC.element_to_be_clickable((
-        By.XPATH,
-        "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LUCKY 7') or " +
-        "contains(translate(., 'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'LUCKY7')]"
-    )))
-    safe_click(driver, el)
-    time.sleep(2)
+    # Final fallback: proceed; some pages already open the Lucky7 pane by default
+    return False
 
 def click_first_game_in_active_pane(driver):
     """
-    Clicks the first game tile under the ACTIVE tab/pane (Lucky 7 panel).
-    Tries:
-      1) First '.casino-name' ancestor tile
-      2) Fallback to first tile-like element in the pane
-    Switches to the newly opened tab/window if one appears.
+    Click the first game tile in the active Lucky7 pane (tile parent node), then switch to game window and iframe.
     """
-    # Scope to an active pane (div with 'active' class)
     try:
         pane = W(driver, EC.visibility_of_element_located((
             By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]"
-        )))
+        )), 15)
     except TimeoutException:
-        pane = driver  # fallback to whole doc
+        pane = driver
 
-    # Option 1: a casino-name inside
     tiles = pane.find_elements(By.XPATH, ".//*[contains(@class,'casino-name')]")
-    if tiles:
-        tile = tiles[0].find_element(By.XPATH, "..")
-        driver.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", tile)
-        time.sleep(0.2)
-        try:
-            tile.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", tile)
-    else:
-        # Option 2: first tile-looking element
-        candidates = pane.find_elements(By.XPATH, ".//*[contains(@class,'casinoicon') or contains(@class,'casinoicons') or contains(@class,'casino-') or self::a]")
-        if not candidates:
-            raise RuntimeError("Could not find any game tiles in the active pane")
-        cand = candidates[0]
-        driver.execute_script("arguments[0].scrollIntoView({block:'center',inline:'center'});", cand)
-        time.sleep(0.2)
-        try:
-            cand.click()
-        except Exception:
-            driver.execute_script("arguments[0].click();", cand)
+    target = tiles[0].find_element(By.XPATH, "..") if tiles else None
+    if not target:
+        cands = pane.find_elements(By.XPATH, ".//*[contains(@class,'casinoicon') or contains(@class,'casinoicons') or contains(@class,'casino-') or self::a]")
+        target = cands[0] if cands else None
+    if not target:
+        raise RuntimeError("No game tiles found in Lucky 7 pane")
 
-    time.sleep(0.5)
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
+    time.sleep(0.2); safe_click(driver, target)
+    time.sleep(0.8)
+
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
-        print("↪️ Switched to game window")
+    time.sleep(2.0)
 
-    # Some games are inside an iframe; try the first iframe if present
-    time.sleep(3)
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     if iframes:
         driver.switch_to.frame(iframes[0])
-        print("↪️ Switched into game iframe")
 
-# ===================== Scraping (Lucky 7: single card) =====================
+# ===================== Round helpers =====================
 def find_round_id_text(driver) -> Optional[str]:
-    # Best-guess selectors; harmless if missing
     for sel in [".round-id", ".casino-round-id", "span.roundId", "div.round-id"]:
         try:
             el = driver.find_element(By.CSS_SELECTOR, sel)
-            txt = el.text.strip()
-            if txt: return txt
+            t = el.text.strip()
+            if t: return t
         except NoSuchElementException:
             continue
     return None
 
-def extract_card_from_page(driver) -> Optional[Dict[str, Any]]:
-    """Returns {'rank': int, 'suit_key': 'S|H|D|C'} or None if not visible yet."""
-    html = driver.page_source
-    soup = BeautifulSoup(html, "html.parser")
-
-    # Strategy 1: look for one visible card image inside likely containers
-    img = None
-    # common containers on similar sites
-    for q in [
-        "div.l-cards img", "div.card1-ctn img", "div.card img", "img[src*='cards']",
-        "div.result-card img", "div.open-card img"
-    ]:
-        node = soup.select_one(q)
-        if node and node.get("src"):
-            img = node; break
-
-    if img:
-        src = img.get("src")
-        # try to parse code from filename: e.g., ".../7H.png" or "ace_of_spades.png"
-        m = re.search(r"/([AJQK]|10|[2-9])([SHDC])\.", src, re.I)
-        if m:
-            rank_txt, suit_chr = m.group(1).upper(), m.group(2).upper()
-            rank = RANK_MAP["10"] if rank_txt == "10" else (RANK_MAP[rank_txt] if rank_txt in RANK_MAP else None)
-            return {"rank": rank, "suit_key": suit_chr}
-        # words style
-        m2 = re.search(r"(ace|jack|queen|king|10|[2-9]).*?(spade|heart|diamond|club)s?", src, re.I)
-        if m2:
-            rtxt = m2.group(1).upper()
-            stxt = m2.group(2).upper()
-            # map rank text to value
-            rank = RANK_MAP.get(rtxt) or (10 if rtxt == "10" else (int(rtxt) if rtxt.isdigit() else None))
-            suit_key = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}[stxt]
-            return {"rank": rank, "suit_key": suit_key}
-
-    # Strategy 2: textual rank/suit on page
-    # Look for suit symbol and a nearby rank
-    text = soup.get_text(" ", strip=True)
-    sym = None
-    for s in ["♠","♥","♦","♣"]:
-        if s in text: sym = s; break
-    if sym:
-        m3 = re.search(r"(A|10|[2-9]|J|Q|K)", text, re.I)
-        if m3:
-            rank_txt = m3.group(1).upper()
-            rank = RANK_MAP.get(rank_txt) or (10 if rank_txt == "10" else (int(rank_txt) if rank_txt.isdigit() else None))
-            suit_key = SUIT_MAP[sym]["key"]
-            return {"rank": rank, "suit_key": suit_key}
-
-    return None
-
-def ensure_csv(path: str):
-    exists = os.path.exists(path)
-    if not exists:
-        with open(path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=HEADERS)
-            w.writeheader()
-
-def append_row(path: str, row: Dict[str, Any]):
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=HEADERS)
-        w.writerow({k: row.get(k) for k in HEADERS})
-
 # ===================== Main =====================
 def main():
+    print(f"📊 CSV → {CSV_PATH}")
     driver = make_driver()
+    ensure_csv(CSV_PATH)
 
     try:
+        # Login + strict click navigation (no direct URL shortcuts)
         login_same_site(driver)
+        W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 30)
         click_nav_casino(driver)
         click_lucky7_subtab(driver)
         click_first_game_in_active_pane(driver)
         print("✅ Entered Lucky 7 game")
 
-        ensure_csv(CSV_PATH)
         last_sig = None
-        last_round_id = None
-        round_counter = 1
+        saved = 0
+        round_num = 1
 
         while True:
-            print(f"--- Waiting for Round {round_counter} ---")
-            start = time.time()
-            card = None
+            t0 = time.time()
+            parsed = None
 
-            while not card:
-                card = extract_card_from_page(driver)
-                if card:
+            while not parsed:
+                urls = extract_card_img_urls(driver.page_source)
+                for u in urls:
+                    parsed = parse_from_url(u)
+                    if parsed:
+                        break
+                if parsed:
                     break
-                if time.time() - start > ROUND_TIMEOUT:
-                    print("⏳ Round timeout → refresh")
-                    driver.refresh()
-                    time.sleep(6)
-                    # re-enter iframe if present
-                    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-                    if iframes:
-                        driver.switch_to.frame(iframes[0])
-                    start = time.time()
-                time.sleep(0.5)
 
-            round_id = find_round_id_text(driver)
-            rank, suit_key = card["rank"], card["suit_key"]
-            feats = derive_features(rank, suit_key)
+                # search sibling iframes (depth 1)
+                driver.switch_to.default_content()
+                for fr in driver.find_elements(By.TAG_NAME, "iframe"):
+                    try:
+                        driver.switch_to.frame(fr)
+                        urls = extract_card_img_urls(driver.page_source)
+                        for u in urls:
+                            parsed = parse_from_url(u)
+                            if parsed: break
+                        if parsed: break
+                    finally:
+                        driver.switch_to.default_content()
 
-            # Dedupe
-            sig = f"{round_id}|{rank}|{suit_key}"
-            if round_id:
-                if round_id == last_round_id:
-                    time.sleep(POLL_SEC); continue
-                last_round_id = round_id
-            else:
-                if sig == last_sig:
-                    time.sleep(POLL_SEC); continue
-                last_sig = sig
+                # re-enter first iframe for next cycles
+                if parsed:
+                    try:
+                        driver.switch_to.frame(driver.find_elements(By.TAG_NAME, "iframe")[0])
+                    except Exception:
+                        pass
+                    break
 
+                if time.time() - t0 > ROUND_TIMEOUT:
+                    driver.refresh(); time.sleep(5)
+                    ifr = driver.find_elements(By.TAG_NAME, "iframe")
+                    if ifr:
+                        driver.switch_to.frame(ifr[0])
+                    t0 = time.time()
+
+                time.sleep(0.3 + random.uniform(0.05,0.2))
+
+            # Compose row
+            rid = find_round_id_text(driver)
+            rank, suit = parsed["rank"], parsed["suit_key"]
+            color = "red" if suit in ("H","D") else "black"
+            res = result_of(rank)
             row = {
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
-                "round_id": round_id,
+                "round_id": rid,
                 "rank": rank,
-                "suit_key": suit_key,
-                "color": feats["color"],
-                "is_odd": int(feats["is_odd"]),
-                "is_even": int(feats["is_even"]),
-                "is_red": int(feats["is_red"]),
-                "is_black": int(feats["is_black"]),
-                "cat_below7": int(feats["cat_below7"]),
-                "cat_seven": int(feats["cat_seven"]),
-                "cat_above7": int(feats["cat_above7"]),
+                "suit_key": suit,
+                "color": color,
+                "result": res,
             }
-            append_row(CSV_PATH, row)
-            print(f"💾 Saved Round: round_id={round_id} card={rank}{suit_key}")
 
-            round_counter += 1
+            # Dedupe (signature)
+            sig = f"{rid}|{rank}|{suit}"
+            if sig == last_sig:
+                time.sleep(POLL_SEC); 
+                continue
+            last_sig = sig
+
+            append_row(CSV_PATH, row)
+            print(f"✅ Round {round_num}: {rank}{suit} → {res}")
+            saved += 1
+            if MAX_ROUNDS and saved >= MAX_ROUNDS:
+                print(f"🏁 Done — captured {saved} rounds.")
+                break
+
+            round_num += 1
             time.sleep(POLL_SEC)
 
     except KeyboardInterrupt:
-        print("🛑 Stopped by user.")
+        print("🛑 Stopped by user")
     finally:
-        try:
-            driver.quit()
-        except Exception:
-            pass
+        try: driver.quit()
+        except Exception: pass
 
 if __name__ == "__main__":
     main()
