@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# Lucky 7 — Scraper vA.8
-# Adds Shadow DOM traversal to discover card assets/text inside shadow roots.
-# Keeps: login → casino → Lucky7 → first-game; deep iframes; DOM + JS hints; CDP network; text/JSON fallbacks.
-# Writes clean CSV; dumps rich debug artifacts.
+# Lucky 7 — Scraper vA.10
+# - Shadow DOM + deep iframes + CDP network + text/JSON fallbacks.
+# - Next-round gate with clear logs and auto-nudges (Play/Join/Enter click, canvas tap, iframe reattach, refresh).
+# - Deterministic shadow signature (sha1) for reliable change detection.
+# - Clean CSV append (no image URLs).
 
-import os, re, csv, time, random, json
+import os, re, csv, time, random, json, hashlib
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
 
@@ -29,7 +30,7 @@ if not USERNAME or not PASSWORD:
 CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.2"))
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "120"))
-RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))   # ~50 minutes per run
+RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))   # ~50 minutes per run on GH Actions
 MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))       # 0 = unlimited
 DEBUG_DUMP    = int(os.getenv("DEBUG_DUMP", "1"))
 
@@ -95,6 +96,7 @@ def card_from(rank_txt: str, suit_txt: str) -> Optional[Dict[str,Any]]:
     return {"rank": RANK_MAP[rtxt], "suit_key": s}
 
 def parse_from_any(s: str) -> Optional[Dict[str, Any]]:
+    if not s: return None
     low = s.lower()
     if any(h in low for h in CLOSED_HINTS): return None
     m = PAT_SIMPLE.search(s)
@@ -129,9 +131,6 @@ def parse_from_text(html: str) -> Optional[Dict[str,Any]]:
         return card_from(m.group(1), m.group(2))
     return None
 
-def color_of(suit_key: str) -> str:
-    return "red" if suit_key in ("H","D") else "black"
-
 def result_of(rank: int) -> str:
     if rank < 7: return "below7"
     if rank == 7: return "seven"
@@ -161,18 +160,15 @@ def extract_card_sources_from_html(html: str) -> List[str]:
             add(img.get("src"))
             for a in ("data-src","data-original","data-lazy","srcset","data-srcset"):
                 v = img.get(a)
-                if v: add(v.split(",")[0])
+                if v: add(v.split(',')[0])
 
     for sel in ["div.casino-video-cards img","div.flip-card-container img","div.card img","img"]:
         for img in soup.select(sel):
             add(img.get("src"))
-    # background-image + class/data-* hints
     for el in soup.find_all(True):
         style = (el.get("style") or "")
         m = re.search(r"background-image\s*:\s*url\(([^)]+)\)", style, re.I)
-        if m:
-            u = m.group(1).strip('\'" ')
-            add(u)
+        if m: add(m.group(1).strip('\'" '))
         dr, ds = el.get("data-rank"), el.get("data-suit")
         if dr and ds: add(f"/{str(dr).upper()}{str(ds).upper()}.png")
         cls = " ".join(el.get("class") or [])
@@ -180,7 +176,7 @@ def extract_card_sources_from_html(html: str) -> List[str]:
         if m2: add(f"/{m2.group(1).upper()}{m2.group(2).upper()}.png")
     return urls
 
-# ------------ JS (regular DOM) hints ------------
+# ------------ JS regular DOM & Shadow DOM collectors ------------
 JS_HINTS = r"""
 const out = [];
 const add = (k,v) => { if (!v) return; const s=String(v).trim(); if (!s) return; out.push([k,s]); };
@@ -208,95 +204,64 @@ for (const el of document.querySelectorAll('*')) {
 return out.slice(0, 400);
 """
 
-# ------------ NEW: JS Shadow DOM collector ------------
 JS_SHADOW_COLLECT = r"""
 const out = new Set();
-const tokens = [];
+const toks = [];
 const seen = new WeakSet();
-
 const addUrl = (u) => {
-  if (!u) return;
-  const s = String(u).trim().split(/\s+/)[0];
-  if (!s) return;
+  if (!u) return; const s = String(u).trim().split(/\s+/)[0]; if (!s) return;
   const L = s.toLowerCase();
   if (L.includes('closed') || L.includes('card-back') || L.includes('backside') || L.includes('1_card_20_20')) return;
   out.add(s);
 };
-const addToken = (t) => {
-  if (!t) return;
-  const s = String(t).trim();
-  if (!s) return;
-  tokens.push(s);
-};
+const addTok = (t) => { if (!t) return; const s=String(t).trim(); if (!s) return; toks.push(s); };
 
 const pushFromEl = (root) => {
-  // images
   root.querySelectorAll('img').forEach(img => {
     addUrl(img.getAttribute('src'));
     addUrl(img.getAttribute('data-src'));
     addUrl(img.getAttribute('data-original'));
     addUrl(img.getAttribute('data-lazy'));
-    const sets = [img.getAttribute('srcset'), img.getAttribute('data-srcset')];
+    const sets=[img.getAttribute('srcset'),img.getAttribute('data-srcset')];
     for (const sv of sets) if (sv) addUrl(sv.split(',')[0]);
-    addToken(img.getAttribute('alt'));
-    addToken(img.getAttribute('aria-label'));
+    addTok(img.getAttribute('alt'));
+    addTok(img.getAttribute('aria-label'));
   });
-  // all elements: bg-image + attrs + classes + visible text
   root.querySelectorAll('*').forEach(el => {
     const cs = getComputedStyle(el);
     const bg = cs && cs.backgroundImage || '';
     const m = bg.match(/url\((["']?)(.*?)\1\)/i);
     if (m && m[2]) addUrl(m[2]);
-
     for (const a of ['data-rank','data-suit','data-card','data-value','title','aria-label']) {
-      const v = el.getAttribute(a); if (v) addToken(v);
+      const v = el.getAttribute(a); if (v) addTok(v);
     }
-    const cls = (el.className||'')+'';
-    if (cls) addToken(cls);
+    const cls = (el.className||'')+''; if (cls) addTok(cls);
     const txt = (el.innerText||el.textContent||'').trim();
-    if (txt && txt.length <= 50) addToken(txt);
+    if (txt && txt.length <= 80) addTok(txt);
   });
 };
 
-const stack = [];
-stack.push(document);
-
-while (stack.length) {
-  const node = stack.pop();
+const stack=[document];
+while (stack.length){
+  const node=stack.pop();
   if (!node || seen.has(node)) continue;
   seen.add(node);
-
-  // node can be a Document, ShadowRoot or Element
-  const root = node; // treat generically
-
-  try { pushFromEl(root); } catch(e) {}
-
-  // descend into shadow roots
-  if (root.querySelectorAll) {
-    root.querySelectorAll('*').forEach(el => {
-      if (el.shadowRoot) stack.push(el.shadowRoot);
-    });
+  try { pushFromEl(node); } catch(e){}
+  if (node.querySelectorAll){
+    node.querySelectorAll('*').forEach(el => { if (el.shadowRoot) stack.push(el.shadowRoot); });
   }
 }
-
-const urls = Array.from(out).slice(0, 600);
-const toks = tokens.slice(0, 600);
-return { urls, toks };
+return { urls: Array.from(out).slice(0,800), toks: toks.slice(0,800) };
 """
 
 def js_collect_hints(driver) -> List[Tuple[str,str]]:
-    try:
-        data = driver.execute_script(JS_HINTS) or []
-        return data
-    except Exception:
-        return []
+    try: return driver.execute_script(JS_HINTS) or []
+    except Exception: return []
 
 def js_collect_shadow(driver) -> Tuple[List[str], List[str]]:
     try:
         data = driver.execute_script(JS_SHADOW_COLLECT) or {}
-        urls = data.get("urls", []) or []
-        toks = data.get("toks", []) or []
-        return urls, toks
+        return (data.get("urls", []) or [], data.get("toks", []) or [])
     except Exception:
         return [], []
 
@@ -310,10 +275,8 @@ def tokens_from_js_hints(hints: List[Tuple[str,str]]) -> List[str]:
         else:
             m = re.search(r"\b(A|K|Q|J|10|[2-9])\b.*?\b([SHDC]|SPADE|HEART|DIAMOND|CLUB)\b", vv, re.I)
             if m: toks.append(f"/{m.group(1).upper()}{m.group(2).upper()[0]}.png")
-            # direct symbol like "8♦"
             m2 = re.search(r"\b(A|K|Q|J|10|[2-9])\s*([♠♥♦♣])\b", vv, re.I)
             if m2: toks.append(f"/{m2.group(1).upper()}{m2.group(2)}.png")
-    # uniq & filter backs
     seen=set(); out=[]
     for t in toks:
         if any(h in t.lower() for h in CLOSED_HINTS): continue
@@ -321,13 +284,7 @@ def tokens_from_js_hints(hints: List[Tuple[str,str]]) -> List[str]:
             seen.add(t); out.append(t)
     return out[:800]
 
-def tokens_to_card(tokens: List[str]) -> Optional[Dict[str,Any]]:
-    for t in tokens:
-        p = parse_from_any(t)
-        if p: return p
-    return None
-
-# ------------ CDP network (optional; may be empty if video/canvas only) ------------
+# ------------ CDP Network ------------
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpg|jpeg|webp|gif|webm|svg)(?:\?|#|$)", re.I)
 
 def make_driver():
@@ -480,8 +437,7 @@ def click_first_game_in_active_pane(driver):
     if not target:
         cands = pane.find_elements(By.XPATH, ".//*[contains(@class,'casinoicon') or contains(@class,'casinoicons') or contains(@class,'casino-') or self::a]")
         target = cands[0] if cands else None
-    if not target:
-        raise RuntimeError("No game tiles found in Lucky 7 pane")
+    if not target: raise RuntimeError("No game tiles found in Lucky 7 pane")
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     time.sleep(0.2); safe_click(driver, target)
     time.sleep(0.8)
@@ -489,9 +445,32 @@ def click_first_game_in_active_pane(driver):
         driver.switch_to.window(driver.window_handles[-1])
         print("↪️ Switched to game window")
     time.sleep(2.0)
-    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    if iframes: driver.switch_to.frame(iframes[0])
+    reattach_game_iframe(driver)
     dump_debug(driver, "after_enter_game")
+
+def reattach_game_iframe(driver):
+    """(Re)attach to the most likely game iframe (largest visible one)."""
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    time.sleep(0.3)
+    iframes = driver.find_elements(By.TAG_NAME, "iframe")
+    best = None
+    # Pick the first visible; if many, try each until inside
+    for fr in iframes:
+        try:
+            if fr.is_displayed():
+                best = fr
+                break
+        except Exception:
+            continue
+    if best:
+        driver.switch_to.frame(best)
+    else:
+        # fallback: try first iframe if any
+        if iframes:
+            driver.switch_to.frame(iframes[0])
 
 # ------------ Round search (DOM → Shadow → Network → Text) ------------
 def find_round_id_text(driver) -> Optional[str]:
@@ -524,13 +503,10 @@ def try_parse_here(driver) -> Tuple[Optional[Dict[str,Any]], int, str, List[str]
 def try_parse_shadow(driver) -> Tuple[Optional[Dict[str,Any]], int, str, List[str]]:
     urls, toks = js_collect_shadow(driver)
     seen = []
-    # 1) parse URLs first
     for u in urls:
         seen.append(f"SHURL {u}")
         p = parse_from_any(u)
         if p: return p, len(urls), "via=shadow-url", seen
-    # 2) then tokens (text/classes/attrs)
-    #   convert tokens into URL-like hints for parser
     hints = []
     for t in toks:
         hints.append(t)
@@ -546,7 +522,6 @@ def try_parse_shadow(driver) -> Tuple[Optional[Dict[str,Any]], int, str, List[st
 def dfs_frames_for_card(driver, max_depth=5, depth=0) -> Tuple[Optional[Dict[str,Any]], int, int, str, List[str]]:
     parsed, cnt, how, seen = try_parse_here(driver)
     if parsed: return parsed, cnt, 1, how, seen
-    # Shadow DOM pass at each level
     p2, c2, h2, seen2 = try_parse_shadow(driver)
     if p2: return p2, cnt+c2, 1, h2, seen + seen2
     if depth >= max_depth: return None, cnt+c2, 0, "", seen + seen2
@@ -568,6 +543,104 @@ def dfs_frames_for_card(driver, max_depth=5, depth=0) -> Tuple[Optional[Dict[str
             except Exception: pass
     return None, total_cnt, hits, note, all_seen
 
+# ------------ Next-round gate ------------
+def shadow_signature_hex(driver) -> str:
+    """Deterministic SHA1 of condensed Shadow tokens/urls."""
+    try:
+        urls, toks = js_collect_shadow(driver)
+        toks = [t for t in toks if len(t) <= 80]
+        compact = (urls[-120:] + toks[-360:])
+        key = "|".join(compact)
+        return hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
+    except Exception:
+        return "0"*40
+
+def click_join_play_if_present(driver) -> bool:
+    """Try to click buttons/controls that often gate the live table."""
+    selectors = [
+        "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'PLAY')]",
+        "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'JOIN')]",
+        "//button[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'ENTER')]",
+        "//a[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'PLAY')]",
+        "//a[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'JOIN')]",
+        "//a[contains(translate(.,'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'ENTER')]",
+    ]
+    for xp in selectors:
+        try:
+            els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
+            if els:
+                safe_click(driver, els[0])
+                time.sleep(1.2)
+                return True
+        except Exception:
+            continue
+    return False
+
+def tap_table_center(driver):
+    try:
+        ActionChains(driver).move_by_offset(0,0).perform()  # reset
+    except Exception:
+        pass
+    try:
+        driver.execute_script("""
+            const r = document.body.getBoundingClientRect();
+            return {x: Math.floor((r.left+r.right)/2), y: Math.floor((r.top+r.bottom)/2)};
+        """)
+    except Exception:
+        pass
+    try:
+        # Best-effort center click via JS
+        driver.execute_script("document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click?.()")
+    except Exception:
+        pass
+
+def wait_for_next_round(driver, seen_req_ids: set, network_seen: List[str],
+                        prev_net_len: int, prev_shadow_sig: str, max_wait: int = 120):
+    """Block until network grows or shadow signature changes. Nudge if idle."""
+    start = time.time()
+    last_log = 0
+    nudged_join = False
+    nudged_tap  = False
+    while time.time() - start < max_wait:
+        # network
+        new_urls = collect_network_images(driver, seen_req_ids, network_seen)
+        if len(network_seen) > prev_net_len or new_urls:
+            return "net"
+        # shadow
+        sig = shadow_signature_hex(driver)
+        if sig != prev_shadow_sig:
+            return "shadow"
+
+        waited = int(time.time() - start)
+        if waited >= 20 and not nudged_tap:
+            tap_table_center(driver)   # some tables need a user gesture
+            nudged_tap = True
+        if waited >= 30 and not nudged_join:
+            if click_join_play_if_present(driver):
+                nudged_join = True
+                # after join, give it a moment
+                time.sleep(2.0)
+
+        # small heartbeat
+        if time.time() - last_log >= 5:
+            last_log = time.time()
+            print(f"🟡 Next-round gate… net={len(network_seen)} (prev {prev_net_len}) shadow=same waited={waited}s", flush=True)
+        time.sleep(0.6 + random.uniform(0.0, 0.3))
+
+    # fallback: reattach iframe then refresh
+    print("🔁 No change — reattaching iframe & refreshing", flush=True)
+    try:
+        reattach_game_iframe(driver)
+        time.sleep(1.0)
+    except Exception:
+        pass
+    driver.refresh(); time.sleep(5)
+    try:
+        reattach_game_iframe(driver)
+    except Exception:
+        pass
+    return "refresh"
+
 # ------------ Main ------------
 def main():
     print(f"📊 CSV → {CSV_PATH}", flush=True)
@@ -580,7 +653,6 @@ def main():
     network_seen: List[str] = []
 
     try:
-        # flow
         driver.set_page_load_timeout(120)
         login_same_site(driver)
         W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 30)
@@ -600,54 +672,45 @@ def main():
                 print(f"⏱️ Time cap reached ({int(time.time()-start_ts)}s). Saved {saved} rounds.", flush=True)
                 break
 
+            # ---- Parse current round ----
             t0 = time.time()
             parsed = None
             how = ""
-            seen_tokens: List[str] = []
             imgs_count = 0
             net_count = 0
+            seen_tokens: List[str] = []
 
             while not parsed:
-                # 1) DOM + Shadow + Iframes
                 p, c, h, how_dom, seen = dfs_frames_for_card(driver, max_depth=5)
-                parsed = p
-                how = how_dom or how
-                imgs_count = c
-                seen_tokens = seen
+                parsed = p; imgs_count = c; how = how_dom or how; seen_tokens = seen
 
-                # 2) Network images (canvas/video cases)
                 new_urls = collect_network_images(driver, seen_req_ids, network_seen)
                 net_count = len(network_seen)
                 if not parsed and new_urls:
                     for u in reversed(new_urls):
                         pnet = parse_from_any(u)
-                        if pnet:
-                            parsed = pnet; how = "via=network"; break
+                        if pnet: parsed = pnet; how = "via=network"; break
 
-                # heartbeat every ~5s
                 now = time.time()
                 if now - last_heartbeat >= 5:
                     last_heartbeat = now
-                    frames_top = 0
                     try: frames_top = len(driver.find_elements(By.TAG_NAME, "iframe"))
-                    except Exception: pass
+                    except Exception: frames_top = 0
                     print(f"⏳ Waiting… imgs={imgs_count} frames(top)={frames_top} net={net_count} elapsed={int(time.time()-start_ts)}s", flush=True)
                     dump_debug(driver, f"wait_{int(time.time()-start_ts)}s")
                     dump_text(f"candidates_{int(time.time()-start_ts)}s.txt", [*map(str, seen_tokens[:200])])
                     dump_text("network_seen_tail.txt", network_seen[-200:])
 
                 if parsed: break
-
                 if time.time() - t0 > ROUND_TIMEOUT:
                     print("🔄 Round timeout: refreshing game view", flush=True)
                     driver.refresh(); time.sleep(5)
-                    ifr = driver.find_elements(By.TAG_NAME, "iframe")
-                    if ifr: driver.switch_to.frame(ifr[0])
+                    try: reattach_game_iframe(driver)
+                    except Exception: pass
                     t0 = time.time()
-
                 time.sleep(0.35 + random.uniform(0.05, 0.25))
 
-            # Save row
+            # ---- Save row ----
             rid = find_round_id_text(driver)
             rank, suit = parsed["rank"], parsed["suit_key"]
             row = {
@@ -659,19 +722,34 @@ def main():
                 "result": result_of(rank),
             }
             sig = f"{rid}|{rank}|{suit}"
-            if sig == last_sig:
-                time.sleep(POLL_SEC); continue
-            last_sig = sig
 
-            append_row(CSV_PATH, row)
-            print(f"✅ Round {round_num}: {rank}{suit} → {row['result']} ({how})", flush=True)
-            saved += 1
+            if sig != last_sig:
+                append_row(CSV_PATH, row)
+                print(f"✅ Round {round_num}: {rank}{suit} → {row['result']} ({how})", flush=True)
+                saved += 1
+                last_sig = sig
+                round_num += 1
+            else:
+                # same card snapshot (e.g., after refresh) — do not append duplicate
+                print("ℹ️ Same card snapshot detected; not appending duplicate. Entering next-round gate…", flush=True)
+
+            # ---- Next-round gate ----
+            prev_net_len = len(network_seen)
+            prev_shadow = shadow_signature_hex(driver)
+            gate_result = wait_for_next_round(
+                driver,
+                seen_req_ids=seen_req_ids,
+                network_seen=network_seen,
+                prev_net_len=prev_net_len,
+                prev_shadow_sig=prev_shadow,
+                max_wait=120
+            )
+            # end gate
 
             if (MAX_ROUNDS and saved >= MAX_ROUNDS) or (RUN_SECONDS and (time.time() - start_ts) >= RUN_SECONDS):
                 print(f"🏁 Done — captured {saved} rounds in {int(time.time()-start_ts)}s.", flush=True)
                 break
 
-            round_num += 1
             time.sleep(POLL_SEC)
 
     except KeyboardInterrupt:
