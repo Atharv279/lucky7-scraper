@@ -1,55 +1,47 @@
-name: Lucky7 Scraper (near-24/7)
+name: lucky7-scrape
 
 on:
   schedule:
-    - cron: "*/5 * * * *"        # every 5 minutes
+    - cron: "*/5 * * * *"   # every 5 minutes
   workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 55
-    # Queue runs; do NOT cancel the one currently scraping
     concurrency:
       group: lucky7-scrape-${{ github.ref }}
       cancel-in-progress: false
-
     permissions:
       contents: write
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
-      - name: Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Install Google Chrome
+      - name: Install Chrome
         uses: browser-actions/setup-chrome@v1
 
-      - name: Install Xvfb (virtual display)
+      - name: Xvfb
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
-      - name: Install Python deps
-        shell: bash
+      - name: Pip install
         run: |
           python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          else
-            pip install selenium webdriver-manager beautifulsoup4
-          fi
+          pip install selenium webdriver-manager beautifulsoup4
 
-      - name: Run scraper (GUI via Xvfb) ~50 minutes
+      - name: Run scraper
         env:
           NOH_USER: ${{ secrets.NOH_USER }}
           NOH_PASS: ${{ secrets.NOH_PASS }}
-          RUN_SECONDS: "3000"
+          RUN_SECONDS: "3000"      # ~50 minutes/run
           MAX_ROUNDS: "0"
           CSV_PATH: "lucky7_data.csv"
           PYTHONUNBUFFERED: "1"
@@ -61,9 +53,14 @@ jobs:
         if: always()
         run: |
           ls -lah
-          [ -f lucky7_data.csv ] && tail -n 30 lucky7_data.csv || echo "CSV not created yet"
+          if [ -f lucky7_data.csv ]; then
+            echo "---- CSV tail ----"
+            tail -n 50 lucky7_data.csv
+          else
+            echo "CSV not created."
+          fi
 
-      - name: Upload debug artifacts
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -73,7 +70,7 @@ jobs:
             lucky7_data.csv
           if-no-files-found: warn
 
-      - name: Commit CSV changes
+      - name: Commit CSV
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "data: update CSV [skip ci]"
