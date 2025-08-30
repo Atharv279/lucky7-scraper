@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-# Lucky 7 / HI LOW — Scraper vA.14
-# - Targets "HI LOW" game pane by default (with Lucky 7 fallback).
-# - Join clicker: only inside iframes; ignores Rules/Help/FAQ/nav.
-# - Performance logs enabled for JSON/network parsing.
-# - Clean CSV rows + next-round gate + reopen fallback.
+# Lucky 7 / Hi-Low Scraper — CI-ready
+# - Closes top-page modals (force-change-password, marketing, backdrops) BEFORE opening tables
+# - Prefers "LUCKY 7" pane (HI LOW as fallback)
+# - Clicks join/next only INSIDE provider iframes (prevents header misclicks)
+# - Refreshes / rotates tables if stuck
+# - Writes clean CSV + optional debug HTML/PNG
 
 import os, re, csv, time, random, json, hashlib
 from datetime import datetime, timezone
@@ -17,10 +18,10 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import NoSuchElementException, TimeoutException, WebDriverException
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager
 
-# ---------- ENV / CONFIG ----------
+# ---------- ENV ----------
 URL           = os.getenv("LUCKY7_URL", "https://nohmy99.vip/home")
 USERNAME      = os.getenv("NOH_USER")
 PASSWORD      = os.getenv("NOH_PASS")
@@ -28,20 +29,15 @@ if not USERNAME or not PASSWORD:
     raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
 CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
+RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))    # ~50 min
+MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))        # 0 = unlimited
+ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.0"))
-ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "120"))
-RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))
-MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))
 DEBUG_DUMP    = int(os.getenv("DEBUG_DUMP", "1"))
+MAX_TABLES    = int(os.getenv("MAX_TABLES", "10"))
+GAME_PREF     = (os.getenv("GAME_PREF") or "LUCKY 7").strip().upper()
 
-# game tab preference (defaults to HI LOW)
-GAME_PREF     = (os.getenv("GAME_PREF") or "HI LOW").strip().upper()
-GAME_TAB_NAMES = [
-    GAME_PREF,                   # user's preferred token first
-    "HI LOW","HIGH LOW","HI-LOW","HIGHLOW",
-    "LUCKY 7","LUCKY7"
-]
-
+GAME_TAB_NAMES = [GAME_PREF, "LUCKY 7", "LUCKY7", "HI LOW", "HIGH LOW", "HI-LOW", "HIGHLOW"]
 HEADERS = ["ts_utc","round_id","rank","suit_key","color","result"]
 
 # ---------- CSV / DEBUG ----------
@@ -63,7 +59,7 @@ def dump_text(name: str, lines: List[str]):
     ensure_debug()
     try:
         with open(f"debug/{name}", "w", encoding="utf-8") as f:
-            for l in lines: f.write(str(l) + "\n")
+            for l in lines: f.write(str(l)+"\n")
     except Exception: pass
 
 def dump_debug_html(driver, tag="snapshot"):
@@ -77,10 +73,10 @@ def dump_debug_html(driver, tag="snapshot"):
         driver.save_screenshot(f"debug/{tag}.png")
     except Exception: pass
 
-# ---------- CARD/RULES ----------
-RANK_MAP  = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
-SUIT_WORD = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}
-SUIT_SYMBOL = {"♠":"S","♥":"H","♦":"D","♣":"C"}
+# ---------- CARD / RULES ----------
+RANK_MAP   = {"A":1,"2":2,"3":3,"4":4,"5":5,"6":6,"7":7,"8":8,"9":9,"10":10,"J":11,"Q":12,"K":13}
+SUIT_WORD  = {"SPADE":"S","HEART":"H","DIAMOND":"D","CLUB":"C"}
+SUIT_SYMBOL= {"♠":"S","♥":"H","♦":"D","♣":"C"}
 CLOSED_HINTS = ("closed","back","backside","card-back","1_card_20_20")
 
 def color_of(suit_key: str) -> str: return "red" if suit_key in ("H","D") else "black"
@@ -110,12 +106,14 @@ def parse_from_any(s: str) -> Optional[Dict[str, Any]]:
     if not s: return None
     low = s.lower()
     if any(h in low for h in CLOSED_HINTS): return None
-    for pat in (PAT_SIMPLE, PAT_DOUBLE, PAT_WORDY, PAT_CLASS):
-        m = pat.search(s)
-        if m:
-            if pat is PAT_DOUBLE: return card_from(m.group(1), m.group(2)[0])
-            if pat is PAT_WORDY:  return card_from(m.group(1), m.group(2))
-            return card_from(m.group(1), m.group(2))
+    m = PAT_SIMPLE.search(s)
+    if m: return card_from(m.group(1), m.group(2))
+    m = PAT_DOUBLE.search(s)
+    if m: return card_from(m.group(1), m.group(2)[0])
+    m = PAT_WORDY.search(s)
+    if m: return card_from(m.group(1), m.group(2))
+    m = PAT_CLASS.search(s)
+    if m: return card_from(m.group(1), m.group(2))
     return None
 
 def parse_from_text(html: str) -> Optional[Dict[str,Any]]:
@@ -138,7 +136,7 @@ def parse_from_text(html: str) -> Optional[Dict[str,Any]]:
     if m: return card_from(m.group(1), m.group(2))
     return None
 
-# ---------- HTML discovery ----------
+# ---------- HTML/JS collectors ----------
 def extract_card_sources_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, "html.parser")
     urls: List[str] = []
@@ -163,11 +161,8 @@ def extract_card_sources_from_html(html: str) -> List[str]:
             for a in ("data-src","data-original","data-lazy","srcset","data-srcset"):
                 v = img.get(a)
                 if v: add(v.split(",")[0])
-
     for sel in ["div.casino-video-cards img","div.flip-card-container img","div.card img","img"]:
-        for img in soup.select(sel):
-            add(img.get("src"))
-
+        for img in soup.select(sel): add(img.get("src"))
     for el in soup.find_all(True):
         style = (el.get("style") or "")
         m = re.search(r"background-image\s*:\s*url\(([^)]+)\)", style, re.I)
@@ -179,7 +174,6 @@ def extract_card_sources_from_html(html: str) -> List[str]:
         if m2: add(f"/{m2.group(1).upper()}{m2.group(2).upper()}.png")
     return urls
 
-# ---------- JS collectors ----------
 JS_HINTS = r"""
 const out = [];
 const add = (k,v) => { if (!v) return; const s=String(v).trim(); if (!s) return; out.push([k,s]); };
@@ -257,7 +251,7 @@ while (stack.length){
 return { urls: Array.from(out).slice(0,800), toks: toks.slice(0,800) };
 """
 
-def js_collect_hints(driver): 
+def js_collect_hints(driver):
     try: return driver.execute_script(JS_HINTS) or []
     except Exception: return []
 
@@ -277,9 +271,9 @@ def tokens_from_js_hints(hints):
             toks.append(vv.split()[0])
         else:
             m = re.search(r"\b(A|K|Q|J|10|[2-9])\b.*?\b([SHDC]|SPADE|HEART|DIAMOND|CLUB)\b", vv, re.I)
-            if m: toks.append(f"/{m.group(1).upper()}{m.group(2).upper()[0]}.png")
+            if m: toks.append("/%s%s.png" % (m.group(1).upper(), m.group(2).upper()[0]))
             m2 = re.search(r"\b(A|K|Q|J|10|[2-9])\s*([♠♥♦♣])\b", vv, re.I)
-            if m2: toks.append(f"/{m2.group(1).upper()}{m2.group(2)}.png")
+            if m2: toks.append("/%s%s.png" % (m2.group(1).upper(), m2.group(2)))
     seen=set(); out=[]
     for t in toks:
         if any(h in t.lower() for h in CLOSED_HINTS): continue
@@ -287,7 +281,7 @@ def tokens_from_js_hints(hints):
             seen.add(t); out.append(t)
     return out[:800]
 
-# ---------- CDP / Network ----------
+# ---------- Driver / Network ----------
 IMAGE_EXT_RE = re.compile(r"\.(?:png|jpe?g|webp|gif|webm|svg)(?:\?|#|$)", re.I)
 
 def make_driver():
@@ -297,7 +291,6 @@ def make_driver():
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--window-size=1600,900")
     opts.add_argument("--log-level=3")
-    # Performance logs (so we can parse JSON & images)
     opts.set_capability("goog:loggingPrefs", {"performance":"ALL"})
     driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
     try:
@@ -307,9 +300,12 @@ def make_driver():
     return driver
 
 def W(driver, cond, timeout=15): return WebDriverWait(driver, timeout).until(cond)
+
 def safe_click(driver, el):
-    try: ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
-    except Exception: driver.execute_script("arguments[0].click();", el)
+    try:
+        ActionChains(driver).move_to_element(el).pause(0.05).click().perform()
+    except Exception:
+        driver.execute_script("arguments[0].click();", el)
 
 def collect_network_images(driver, seen_req_ids: set, store: List[str]) -> List[str]:
     out_new = []; lines_dump=[]
@@ -357,8 +353,8 @@ def collect_network_json_card(driver, seen_json_ids: set) -> Tuple[Optional[Dict
                     rank_num = int(m.group(1)); suit = SUIT_WORD.get(m.group(2).upper(), m.group(2)[0].upper())
                     if 1 <= rank_num <= 13: card = {"rank": rank_num, "suit_key": suit}
                 if not card:
-                    m = PAT_JSON_2.search(body)
-                    if m: card = card_from(m.group(1), m.group(2))
+                    m2 = PAT_JSON_2.search(body)
+                    if m2: card = card_from(m2.group(1), m2.group(2))
                 mR = PAT_ROUNDID.search(body)
                 if mR: round_id = (mR.group(1) or "").strip()
                 if not card:
@@ -372,23 +368,100 @@ def collect_network_json_card(driver, seen_json_ids: set) -> Tuple[Optional[Dict
             continue
     return None, None
 
-# ---------- Navigation ----------
+# ---------- Navigation / Modals ----------
 def login_same_site(driver):
-    driver.get(URL); time.sleep(2.5)
+    driver.get(URL); time.sleep(2.0)
+    # open login if present
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(1.0)
+    time.sleep(0.8)
     try:
-        user_input = driver.find_element(By.XPATH, "//input[@name='User Name']")
-        pass_input = driver.find_element(By.XPATH, "//input[@name='Password']")
+        user_input = driver.find_element(By.XPATH, "//input[@name='User Name' or @name='username' or contains(@placeholder,'User')]")
+        pass_input = driver.find_element(By.XPATH, "//input[@name='Password' or @name='password' or @type='password']")
         user_input.clear(); user_input.send_keys(USERNAME)
         pass_input.clear(); pass_input.send_keys(PASSWORD)
         pass_input.submit()
         print("✅ Logged in", flush=True)
     except NoSuchElementException:
         print("⚠️ Login inputs not found; maybe already logged in", flush=True)
-    time.sleep(2.0); dump_debug_html(driver, "after_login")
+    time.sleep(1.5); dump_debug_html(driver, "after_login")
+
+# Strong modal killer (outside iframe)
+CLOSE_WORDS = [
+    "CLOSE","OK","GOT IT","DISMISS","ACCEPT","I AGREE","START","ENTER","WATCH NOW","CONTINUE",
+    "X","×","SKIP","LATER","NOT NOW","CANCEL","NO THANKS","REMIND ME LATER"
+]
+def close_top_modal(driver, attempts=5) -> bool:
+    """
+    Click/kill top-page modals/backdrops that block opening tables (force-change-password, marketing, etc.).
+    Tries buttons first; if none, force-hides containers and clears body 'modal-open'.
+    """
+    did_any = False
+    for _ in range(attempts):
+        try: driver.switch_to.default_content()
+        except Exception: pass
+        try:
+            clicked = driver.execute_script("""
+                const WORDS = arguments[0].map(s=>String(s||'').toUpperCase());
+                const U = s => (s||'').toUpperCase();
+                const hideNode = (el) => {
+                  if (!el) return false;
+                  el.style.setProperty('display','none','important');
+                  el.style.setProperty('visibility','hidden','important');
+                  el.style.setProperty('pointer-events','none','important');
+                  el.setAttribute('hidden','true');
+                  if (el.parentElement) { try { el.parentElement.removeChild(el); } catch(e) {} }
+                  return true;
+                };
+                for (const node of [document.documentElement, document.body]) {
+                  if (!node) continue;
+                  node.classList.remove('modal-open','overflow-hidden','no-scroll');
+                  node.style.removeProperty('overflow');
+                }
+                const sels = [
+                  '.modal.show', '.modal', '.modal-backdrop',
+                  '.swal2-container', '.swal2-popup',
+                  '.overlay', '.popup', '.modal-market',
+                  '.force-change-password-popup', '.bookModal', '.app_version'
+                ];
+                let acted = false;
+                const poster = document.querySelector('img[src*="poster-login-popup"]');
+                if (poster) {
+                  let p = poster; for (let i=0;i<4 && p;i++) p = p.parentElement;
+                  if (p) { hideNode(p); acted = true; }
+                }
+                const containers = [];
+                for (const sel of sels) document.querySelectorAll(sel).forEach(el => { if (el && !containers.includes(el)) containers.push(el); });
+                for (const modal of containers) {
+                  if (!modal || !modal.offsetParent) continue;
+                  const btns = modal.querySelectorAll('button,a,div[role="button"],span,[aria-label]');
+                  for (const b of btns) {
+                    if (!b || !b.offsetParent) continue;
+                    const t = U(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+                    if (t && WORDS.some(w => t.includes(w))) { try { b.click(); acted = true; } catch(e){} }
+                  }
+                }
+                if (!acted) for (const modal of containers) { try { if (hideNode(modal)) acted = true; } catch(e){} }
+                document.querySelectorAll('.modal-backdrop, .cdk-overlay-backdrop').forEach(bd => hideNode(bd));
+                return !!acted;
+            """, CLOSE_WORDS)
+            if clicked:
+                did_any = True
+                time.sleep(1.0)
+        except Exception:
+            pass
+        # done if clean
+        try:
+            has_modal = driver.execute_script("""
+                const sels = ['.modal.show','.modal','.modal-backdrop','.swal2-container','.overlay','.popup','.modal-market','.force-change-password-popup','.bookModal','.app_version'];
+                return sels.some(s => document.querySelector(s));
+            """)
+            if not has_modal: break
+        except Exception:
+            break
+    if did_any: print("🟢 Closed/removed top-page modal", flush=True)
+    return did_any
 
 def click_nav_casino(driver, timeout=45):
     def click_it(el):
@@ -412,6 +485,7 @@ def click_nav_casino(driver, timeout=45):
         for xp in xps:
             els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
             if els: click_it(els[0]); time.sleep(1.5); return
+        # fallback via JS
         try:
             clicked = bool(driver.execute_script("""
                 const U=s=> (s||'').toUpperCase();
@@ -426,7 +500,6 @@ def click_nav_casino(driver, timeout=45):
     raise TimeoutException("Casino link not found")
 
 def click_game_subtab(driver, timeout=45) -> bool:
-    # Try preferred tokens in order
     targets = [t for t in GAME_TAB_NAMES if t]
     def click_it(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
@@ -434,7 +507,6 @@ def click_game_subtab(driver, timeout=45) -> bool:
         try: el.click()
         except Exception: driver.execute_script("arguments[0].click();", el)
     end = time.time() + timeout
-    U = lambda s: (s or "").upper()
     while time.time() < end:
         for token in targets:
             xp = ("//*[self::a or self::button or self::div or self::span or self::li]"
@@ -444,33 +516,29 @@ def click_game_subtab(driver, timeout=45) -> bool:
                 click_it(els[0]); time.sleep(1.2)
                 print(f"🎯 Game tab: {token}", flush=True)
                 return True
-        # try scrolling tab containers
+        # try to scroll tab strip
         for cont in driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")[:3]:
-            try: driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 200;}", cont)
+            try: driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 240;}", cont)
             except Exception: pass
-        # JS fallback
-        try:
-            clicked = bool(driver.execute_script("""
-                const TOKENS = arguments[0].map(s=>String(s||'').toUpperCase());
-                const U=s=> (s||'').toUpperCase();
-                const els=[...document.querySelectorAll('a,button,div,span,li')];
-                const el = els.find(e => {
-                  const t=U(e.innerText||e.textContent);
-                  return TOKENS.some(k=>t.includes(k));
-                });
-                if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
-                return false;
-            """, targets))
-        except Exception: clicked = False
-        if clicked:
-            print("🎯 Game tab: (JS) matched", flush=True)
-            time.sleep(1.2); return True
         time.sleep(0.5)
     return False
 
+def reattach_game_iframe(driver):
+    try: driver.switch_to.default_content()
+    except Exception: pass
+    time.sleep(0.3)
+    frames = driver.find_elements(By.TAG_NAME, "iframe")
+    if frames:
+        for fr in frames[:5]:
+            try:
+                if fr.is_displayed():
+                    driver.switch_to.frame(fr); return
+            except Exception: pass
+        driver.switch_to.frame(frames[0])
+
 def click_first_game_in_active_pane(driver, idx: int = 0):
     try:
-        pane = W(driver, EC.visibility_of_element_located((By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]")), 15)
+        pane = WebDriverWait(driver, 15).until(EC.visibility_of_element_located((By.XPATH, "//*[contains(@class,'tab-pane') and contains(@class,'active')]")))
     except TimeoutException:
         pane = driver
     tiles = pane.find_elements(By.XPATH, ".//*[contains(@class,'casino-name') or contains(@class,'casinoicon') or contains(@class,'casino-') or self::a]")
@@ -480,24 +548,13 @@ def click_first_game_in_active_pane(driver, idx: int = 0):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     time.sleep(0.2); safe_click(driver, target)
     time.sleep(0.8)
+    # popup windows
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
         print("↪️ Switched to game window")
-    time.sleep(2.0); reattach_game_iframe(driver); dump_debug_html(driver, "after_enter_game")
+    time.sleep(2.0); reattach_game_iframe(driver); dump_debug_html(driver, f"after_enter_game_{idx}")
 
-def reattach_game_iframe(driver):
-    try: driver.switch_to.default_content()
-    except Exception: pass
-    time.sleep(0.3)
-    iframes = driver.find_elements(By.TAG_NAME, "iframe")
-    for fr in iframes[:5]:
-        try:
-            if fr.is_displayed():
-                driver.switch_to.frame(fr); return
-        except Exception: pass
-    if iframes: driver.switch_to.frame(iframes[0])
-
-# ---------- Round search ----------
+# ---------- Round parsing ----------
 def try_parse_here(driver):
     html = driver.page_source
     urls = extract_card_sources_from_html(html)
@@ -522,9 +579,9 @@ def try_parse_shadow(driver):
     for t in toks:
         hints.append(t)
         m = re.search(r"\b(A|K|Q|J|10|[2-9])\b.*?\b([SHDC]|SPADE|HEART|DIAMOND|CLUB)\b", t, re.I)
-        if m: hints.append(f"/{m.group(1).upper()}{m.group(2).upper()[0]}.png")
+        if m: hints.append("/%s%s.png" % (m.group(1).upper(), m.group(2).upper()[0]))
         m2 = re.search(r"\b(A|K|Q|J|10|[2-9])\s*([♠♥♦♣])\b", t, re.I)
-        if m2: hints.append(f"/{m2.group(1).upper()}{m2.group(2)}.png")
+        if m2: hints.append("/%s%s.png" % (m2.group(1).upper(), m2.group(2)))
     for h in hints:
         p = parse_from_any(h)
         if p: return p, "via=shadow-text"
@@ -548,6 +605,106 @@ def dfs_frames_for_card(driver, max_depth=5, depth=0):
     return None, ""
 
 # ---------- Next-round helpers ----------
+EXCLUDE_TOKENS = ("RULE","RULES","HELP","FAQ","TERMS","DISCLAIMER","PRIVACY")
+JOIN_WORDS = ["JOIN","PLAY","ENTER","WATCH","START","LIVE","OPEN","SEAT","TAKE SEAT","SIT","CONTINUE",
+              "जॉइन","खेलें","प्रवेश","देखें","लाइव","खोलें",
+              "加入","进入","开始","观看","直播","进入游戏","加入游戏",
+              "参加","開始","入場","観戦","ライブ",
+              "입장","시작","참여","관전","라이브"]
+NEXT_WORDS = ["NEXT","CONTINUE","OK","CLOSE","DISMISS","SKIP","RESULT","REVEAL","SHOW","START","GO",
+              "»","→","▶","⏭","❯","➔","►","आगे","ठीक","बंद","जारी","LIVE"]
+
+def click_tokens_in_this_frame(driver, words) -> bool:
+    try:
+        clicked = driver.execute_script("""
+            const WORDS = arguments[0].map(s=>String(s||'').toUpperCase());
+            const EXC = arguments[1];
+            const U=s=>(s||'').toUpperCase();
+            const els=[...document.querySelectorAll('button,a,div,span,[role="button"],[aria-label]')];
+            const el = els.find(e => {
+              if (!e || !e.offsetParent) return false;
+              const nav = e.closest('nav, header, footer, .nav, .navbar, .menu, .header, .footer, .rules, .help');
+              if (nav) return false;
+              const t=U(e.innerText||e.textContent||e.getAttribute('aria-label')||'');
+              if (EXC.some(x=>t.includes(x))) return false;
+              return WORDS.some(k=>t.includes(k));
+            });
+            if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
+            return false;
+        """, [w.upper() for w in words], list(EXCLUDE_TOKENS))
+        return bool(clicked)
+    except Exception:
+        return False
+
+def deep_join_nudge(driver) -> bool:
+    frames = driver.find_elements(By.TAG_NAME, "iframe")
+    for fr in frames[:5]:
+        try:
+            driver.switch_to.frame(fr)
+            if click_tokens_in_this_frame(driver, JOIN_WORDS):
+                print("🟢 Clicked (iframe) join/play/watch", flush=True)
+                driver.switch_to.parent_frame()
+                return True
+            driver.switch_to.parent_frame()
+        except Exception:
+            try: driver.switch_to.parent_frame()
+            except Exception: pass
+    return False
+
+def poke_next_like(driver) -> bool:
+    did = False
+    frames = driver.find_elements(By.TAG_NAME, "iframe")
+    for fr in frames[:5]:
+        try:
+            driver.switch_to.frame(fr)
+            if click_tokens_in_this_frame(driver, NEXT_WORDS):
+                print("🟢 Clicked (iframe) next/ok", flush=True)
+                did = True
+            driver.switch_to.parent_frame()
+            if did: break
+        except Exception:
+            try: driver.switch_to.parent_frame()
+            except Exception: pass
+    return did
+
+def reopen_table(driver, next_index: int = 0):
+    print("🔃 Re-opening table…", flush=True)
+    try: driver.switch_to.default_content()
+    except Exception: pass
+    try:
+        if len(driver.window_handles) > 1:
+            base = driver.window_handles[0]
+            for h in driver.window_handles[1:]:
+                try: driver.switch_to.window(h); driver.close()
+                except Exception: pass
+            driver.switch_to.window(base)
+    except Exception: pass
+
+    try:
+        driver.get(URL); time.sleep(1.0)
+        close_top_modal(driver, attempts=2)  # ensure lobby is clear
+        click_nav_casino(driver)
+        close_top_modal(driver, attempts=2)
+        if not click_game_subtab(driver): raise RuntimeError("Game subtab not found")
+        close_top_modal(driver, attempts=1)
+        tried = 0
+        for i in range(next_index, next_index + MAX_TABLES):
+            idx = i % max(MAX_TABLES, 1)
+            try:
+                click_first_game_in_active_pane(driver, idx=idx)
+                print(f"🟢 Opened table #{idx+1}", flush=True)
+                break
+            except Exception:
+                tried += 1
+                continue
+        if tried and tried >= MAX_TABLES:
+            print("⚠️ Could not open any table tile.", flush=True)
+    except Exception as e:
+        print(f"⚠️ Re-open navigation error: {e}", flush=True)
+    try: reattach_game_iframe(driver)
+    except Exception: pass
+    time.sleep(2.0)
+
 def shadow_signature_hex(driver) -> str:
     try:
         urls, toks = js_collect_shadow(driver)
@@ -557,143 +714,6 @@ def shadow_signature_hex(driver) -> str:
         return hashlib.sha1(key.encode("utf-8", errors="ignore")).hexdigest()
     except Exception:
         return "0"*40
-
-JOIN_XPATH_ANY = (
-    "//*[self::button or self::a or self::div or self::span]"
-    "[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'JOIN') or "
-    " contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'PLAY') or "
-    " contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'ENTER') or "
-    " contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'WATCH') or "
-    " contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'START') or "
-    " contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LIVE')]"
-)
-
-EXCLUDE_TOKENS = ("RULE","RULES","HELP","FAQ","TERMS","DISCLAIMER")
-
-def good_join_candidate(driver, el) -> bool:
-    try:
-        txt = (el.text or "").strip()
-        tU = txt.upper()
-        if any(x in tU for x in EXCLUDE_TOKENS):
-            return False
-        # avoid header/nav/menu areas
-        return bool(driver.execute_script("""
-            const el = arguments[0];
-            const bad = el.closest('nav, header, footer, .nav, .navbar, .menu, .header, .footer');
-            return bad ? false : true;
-        """, el))
-    except Exception:
-        return False
-
-def log_click(label: str):
-    label = (label or "").strip()
-    if len(label) > 60: label = label[:57] + "..."
-    print(f"🟢 Clicked {label}", flush=True)
-
-def click_join_tokens_inside_frame(driver) -> bool:
-    # Literal XPath (no f-string); filter candidates
-    try:
-        els = [e for e in driver.find_elements(By.XPATH, JOIN_XPATH_ANY) if e.is_displayed()]
-        for e in els:
-            if good_join_candidate(driver, e):
-                safe_click(driver, e); time.sleep(1.2); log_click(e.text or e.get_attribute("outerHTML"))
-                return True
-    except Exception:
-        pass
-    # JS fallback with multi-language tokens, still inside this frame
-    try:
-        clicked = bool(driver.execute_script("""
-            const TOKENS = arguments[0].map(s=>String(s||'').toUpperCase());
-            const EXC = arguments[1];
-            const U=s=>(s||'').toUpperCase();
-            const els=[...document.querySelectorAll('button,a,div,span')];
-            const el = els.find(e => {
-              if (!e.offsetParent) return false;
-              const nav = e.closest('nav, header, footer, .nav, .navbar, .menu, .header, .footer');
-              if (nav) return false;
-              const t=U(e.innerText||e.textContent);
-              if (EXC.some(x=>t.includes(x))) return false;
-              return TOKENS.some(k=>t.includes(k));
-            });
-            if (el) { el.scrollIntoView({block:'center'}); el.click(); return true; }
-            return false;
-        """, ["JOIN","PLAY","ENTER","WATCH","START","LIVE","GO LIVE","OPEN","SEAT","TAKE SEAT","SIT","CONTINUE",
-              "जॉइन","खेलें","प्रवेश","देखें","लाइव","खोलें",
-              "加入","进入","开始","观看","直播","进入游戏","加入游戏",
-              "参加","開始","入場","観戦","ライブ",
-              "입장","시작","참여","관전","라이브"], list(EXCLUDE_TOKENS)))
-        if clicked:
-            print("🟢 Clicked (JS) join/play/watch", flush=True); time.sleep(1.2); return True
-    except Exception:
-        pass
-    return False
-
-def tap_center(driver):
-    try: driver.execute_script("document.elementFromPoint(window.innerWidth/2, window.innerHeight/2)?.click?.()")
-    except Exception: pass
-
-def deep_join_nudge(driver, max_depth=3) -> bool:
-    # Only try inside iframes to avoid clicking site nav/rules
-    joined = False
-    frames = driver.find_elements(By.TAG_NAME, "iframe")
-    for fr in frames[:5]:
-        try:
-            driver.switch_to.frame(fr)
-            if click_join_tokens_inside_frame(driver):
-                joined = True
-                driver.switch_to.parent_frame()
-                break
-            tap_center(driver)
-            # recurse one level deeper
-            for fr2 in driver.find_elements(By.TAG_NAME, "iframe")[:3]:
-                try:
-                    driver.switch_to.frame(fr2)
-                    if click_join_tokens_inside_frame(driver):
-                        joined = True
-                        driver.switch_to.parent_frame(); driver.switch_to.parent_frame()
-                        break
-                    driver.switch_to.parent_frame()
-                except Exception:
-                    try: driver.switch_to.parent_frame()
-                    except Exception: pass
-            driver.switch_to.parent_frame()
-            if joined: break
-        except Exception:
-            try: driver.switch_to.parent_frame()
-            except Exception: pass
-    return joined
-
-def reopen_table(driver):
-    print("🔃 Re-opening table…", flush=True)
-    try: driver.switch_to.default_content()
-    except Exception: pass
-    # close extra windows
-    try:
-        if len(driver.window_handles) > 1:
-            base = driver.window_handles[0]
-            for h in driver.window_handles[1:]:
-                try: driver.switch_to.window(h); driver.close()
-                except Exception: pass
-            driver.switch_to.window(base)
-    except Exception: pass
-    # navigate again
-    try:
-        driver.get(URL); time.sleep(1.0)
-        click_nav_casino(driver)
-        if not click_game_subtab(driver):
-            raise RuntimeError("Game subtab not found")
-        for i in range(3):
-            try:
-                click_first_game_in_active_pane(driver, idx=i)
-                print(f"🟢 Opened table #{i+1}", flush=True)
-                break
-            except Exception:
-                continue
-    except Exception as e:
-        print(f"⚠️ Re-open navigation error: {e}", flush=True)
-    try: reattach_game_iframe(driver)
-    except Exception: pass
-    time.sleep(2.0)
 
 # ---------- Main ----------
 def main():
@@ -707,12 +727,21 @@ def main():
 
     try:
         driver.set_page_load_timeout(120)
+
+        # LOGIN + kill lobby popups
         login_same_site(driver)
-        W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 30)
+        close_top_modal(driver, attempts=5)              # 1) after login
+
+        WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         click_nav_casino(driver)
+        close_top_modal(driver, attempts=3)              # 2) after opening Casino
+
         if not click_game_subtab(driver):
             raise TimeoutException("Could not find required game subtab")
-        click_first_game_in_active_pane(driver)
+        close_top_modal(driver, attempts=2)              # 3) after selecting Lucky7/Hi-Low tab
+
+        table_idx = 0
+        click_first_game_in_active_pane(driver, idx=table_idx)
         print("✅ Entered Lucky 7 / Hi-Low game", flush=True)
 
         start_ts = time.time()
@@ -735,11 +764,13 @@ def main():
                     if pj: parsed, how = pj, "via=json"
                     if pr: rid = pr
                 collect_network_images(driver, seen_img_ids, network_seen)
-
                 if not parsed and (time.time() - t0) > ROUND_TIMEOUT:
-                    print("🔄 Round timeout: refresh + deep join", flush=True)
+                    print("🔄 Round timeout: refresh + join + next", flush=True)
                     driver.refresh(); time.sleep(3)
-                    reattach_game_iframe(driver); deep_join_nudge(driver); t0 = time.time()
+                    reattach_game_iframe(driver)
+                    deep_join_nudge(driver)
+                    poke_next_like(driver)
+                    t0 = time.time()
                 time.sleep(0.35 + random.uniform(0.05,0.25))
 
             # ---- save (skip duplicate) ----
@@ -758,6 +789,7 @@ def main():
                 }
                 append_row(CSV_PATH, row)
                 print(f"✅ Round {round_num}: {rank}{suit} → {row['result']} ({how})", flush=True)
+                dump_debug_html(driver, f"after_save_{round_num}")
                 last_sig = sig; round_num += 1; saved += 1; stuck_cycles = 0
             else:
                 print("ℹ️ Same card snapshot; not appending duplicate.", flush=True)
@@ -774,6 +806,11 @@ def main():
                     break
 
                 waited = int(time.time() - gate_start)
+
+                if waited in (6, 12, 18):
+                    if poke_next_like(driver):
+                        reattach_game_iframe(driver)
+
                 if waited >= 8 and not joined:
                     try: driver.switch_to.default_content()
                     except Exception: pass
@@ -781,14 +818,18 @@ def main():
                         joined = True
                     reattach_game_iframe(driver)
 
-                if waited >= 25:
+                if waited >= 20:
                     print("🔁 No change — refreshing table", flush=True)
                     driver.refresh(); time.sleep(3)
-                    reattach_game_iframe(driver); deep_join_nudge(driver)
+                    reattach_game_iframe(driver)
+                    deep_join_nudge(driver)
+                    poke_next_like(driver)
                     prev_net = len(network_seen); prev_shadow = shadow_signature_hex(driver)
                     gate_start = time.time(); joined=False; stuck_cycles += 1
-                    if stuck_cycles >= 3:
-                        reopen_table(driver); stuck_cycles = 0
+                    if stuck_cycles >= 2:
+                        table_idx = (table_idx + 1) % max(MAX_TABLES, 1)
+                        reopen_table(driver, next_index=table_idx)
+                        stuck_cycles = 0
                         prev_net = len(network_seen); prev_shadow = shadow_signature_hex(driver)
                         gate_start = time.time(); joined=False
 
