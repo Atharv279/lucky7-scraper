@@ -5,6 +5,10 @@ on:
     - cron: "*/20 * * * *"   # every 20 min
   workflow_dispatch: {}
 
+concurrency:
+  group: lucky7-scrape
+  cancel-in-progress: true
+
 jobs:
   scrape:
     runs-on: ubuntu-latest
@@ -32,7 +36,7 @@ jobs:
           NOH_PASS: ${{ secrets.NOH_PASS }}
           LUCKY7_URL: ${{ secrets.LUCKY7_URL }}   # put your site home URL in repo secrets
           CSV_PATH: lucky7_data.csv
-          RUN_SECONDS: 3000            # ~50 min budget per run
+          RUN_SECONDS: 1100            # ≈18m20s to avoid overlap with */20 cron
           MAX_ROUNDS: "0"              # unlimited within time cap
           GAME_PREF: "LUCKY 7"         # prefer Lucky 7; Hi-Low fallback
           MAX_TABLES: "10"             # rotate more tables if stuck
