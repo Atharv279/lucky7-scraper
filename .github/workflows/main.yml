@@ -2,78 +2,71 @@ name: lucky7-scrape
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
+    - cron: "*/20 * * * *"   # every 20 min
   workflow_dispatch: {}
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
     timeout-minutes: 55
-    concurrency:
-      group: lucky7-scrape-${{ github.ref }}
-      cancel-in-progress: false
-    permissions:
-      contents: write
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with: { fetch-depth: 0 }
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install Chrome
-        uses: browser-actions/setup-chrome@v1
-
-      - name: Xvfb
-        run: sudo apt-get update && sudo apt-get install -y xvfb
-
-      - name: Pip install
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
           pip install selenium webdriver-manager beautifulsoup4
 
-      - name: Run scraper
+      - name: Prepare folders
+        run: mkdir -p debug
+
+      - name: Run scraper (Xvfb)
         env:
           NOH_USER: ${{ secrets.NOH_USER }}
           NOH_PASS: ${{ secrets.NOH_PASS }}
-          RUN_SECONDS: "3000"      # ~50 minutes/run
-          MAX_ROUNDS: "0"
-          CSV_PATH: "lucky7_data.csv"
-          PYTHONUNBUFFERED: "1"
+          LUCKY7_URL: ${{ secrets.LUCKY7_URL }}   # put your site home URL in repo secrets
+          CSV_PATH: lucky7_data.csv
+          RUN_SECONDS: 3000            # ~50 min budget per run
+          MAX_ROUNDS: "0"              # unlimited within time cap
+          GAME_PREF: "LUCKY 7"         # prefer Lucky 7; Hi-Low fallback
+          MAX_TABLES: "10"             # rotate more tables if stuck
+          ROUND_TIMEOUT: "120"         # give one round some time to settle
           DEBUG_DUMP: "1"
+          PYTHONUNBUFFERED: "1"
         run: |
           xvfb-run -a -s "-screen 0 1600x900x24" python -u scraper.py
 
-      - name: Show CSV tail
+      - name: Show outputs (tree + CSV head)
         if: always()
         run: |
-          ls -lah
+          echo "Workspace tree:"; ls -lah
+          echo "CSV preview:"
           if [ -f lucky7_data.csv ]; then
-            echo "---- CSV tail ----"
-            tail -n 50 lucky7_data.csv
+            echo "lines:"; wc -l lucky7_data.csv
+            head -n 20 lucky7_data.csv
           else
-            echo "CSV not created."
+            echo "CSV missing"
           fi
+          echo "Debug tree:"; ls -lah debug || true
 
-      - name: Upload artifacts
+      - name: Upload CSV
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-${{ github.run_id }}
-          path: |
-            debug/**
-            lucky7_data.csv
+          name: lucky7-data
+          path: lucky7_data.csv
           if-no-files-found: warn
 
-      - name: Commit CSV
-        uses: stefanzweifel/git-auto-commit-action@v5
+      - name: Upload debug bundle
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          commit_message: "data: update CSV [skip ci]"
-          file_pattern: |
-            lucky7_data.csv
-            data/*.csv
+          name: debug-snapshots
+          path: debug/
+          if-no-files-found: warn
