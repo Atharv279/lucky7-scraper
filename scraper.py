@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# Lucky 7 / Hi-Low Scraper — CI-ready
-# - Closes top-page modals (force-change-password, marketing, backdrops) BEFORE opening tables
-# - Prefers "LUCKY 7" pane (HI LOW as fallback)
-# - Clicks join/next only INSIDE provider iframes (prevents header misclicks)
-# - Refreshes / rotates tables if stuck (aggressive)
-# - Writes clean CSV + optional debug HTML/PNG
+# Lucky 7 / Hi-Low Scraper — CI-ready (iframe join/next nudges + video-center click)
+# - Kills lobby modals
+# - Prefers LUCKY 7 (falls back to HI LOW)
+# - Clicks join/next *inside provider iframes* (text + explicit selectors)
+# - Also clicks center of video/canvas inside iframe to resume
+# - Rotates tables aggressively if stuck
+# - Writes clean CSV + debug HTML/PNG
 
 import os, re, csv, time, random, json, hashlib
 from datetime import datetime, timezone
@@ -29,7 +30,7 @@ if not USERNAME or not PASSWORD:
     raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
 CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
-RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))    # default ~50 min (workflow sets ~18m)
+RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))
 MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))        # 0 = unlimited
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.0"))
@@ -387,16 +388,11 @@ def login_same_site(driver):
         print("⚠️ Login inputs not found; maybe already logged in", flush=True)
     time.sleep(1.5); dump_debug_html(driver, "after_login")
 
-# Strong modal killer (outside iframe)
 CLOSE_WORDS = [
     "CLOSE","OK","GOT IT","DISMISS","ACCEPT","I AGREE","START","ENTER","WATCH NOW","CONTINUE",
     "X","×","SKIP","LATER","NOT NOW","CANCEL","NO THANKS","REMIND ME LATER"
 ]
 def close_top_modal(driver, attempts=5) -> bool:
-    """
-    Click/kill top-page modals/backdrops that block opening tables (force-change-password, marketing, etc.).
-    Tries buttons first; if none, force-hides containers and clears body 'modal-open'.
-    """
     did_any = False
     for _ in range(attempts):
         try: driver.switch_to.default_content()
@@ -438,7 +434,7 @@ def close_top_modal(driver, attempts=5) -> bool:
                   const btns = modal.querySelectorAll('button,a,div[role="button"],span,[aria-label]');
                   for (const b of btns) {
                     if (!b || !b.offsetParent) continue;
-                    const t = U(b.innerText || b.textContent || b.getAttribute('aria-label') || '');
+                    const t=U(b.innerText||b.textContent||b.getAttribute('aria-label')||'');
                     if (t && WORDS.some(w => t.includes(w))) { try { b.click(); acted = true; } catch(e){} }
                   }
                 }
@@ -451,7 +447,6 @@ def close_top_modal(driver, attempts=5) -> bool:
                 time.sleep(1.0)
         except Exception:
             pass
-        # done if clean
         try:
             has_modal = driver.execute_script("""
                 const sels = ['.modal.show','.modal','.modal-backdrop','.swal2-container','.overlay','.popup','.modal-market','.force-change-password-popup','.bookModal','.app_version'];
@@ -516,7 +511,6 @@ def click_game_subtab(driver, timeout=45) -> bool:
                 click_it(els[0]); time.sleep(1.2)
                 print(f"🎯 Game tab: {token}", flush=True)
                 return True
-        # try to scroll tab strip
         for cont in driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")[:3]:
             try: driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 240;}", cont)
             except Exception: pass
@@ -548,7 +542,6 @@ def click_first_game_in_active_pane(driver, idx: int = 0):
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
     time.sleep(0.2); safe_click(driver, target)
     time.sleep(0.8)
-    # popup windows
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
         print("↪️ Switched to game window")
@@ -604,7 +597,7 @@ def dfs_frames_for_card(driver, max_depth=5, depth=0):
             except Exception: pass
     return None, ""
 
-# ---------- Next-round helpers ----------
+# ---------- Extra iframe nudges ----------
 EXCLUDE_TOKENS = ("RULE","RULES","HELP","FAQ","TERMS","DISCLAIMER","PRIVACY")
 JOIN_WORDS = ["JOIN","PLAY","ENTER","WATCH","START","LIVE","OPEN","SEAT","TAKE SEAT","SIT","CONTINUE",
               "PLAY NOW","WATCH LIVE","ENTER TABLE","JOIN TABLE",
@@ -614,6 +607,60 @@ JOIN_WORDS = ["JOIN","PLAY","ENTER","WATCH","START","LIVE","OPEN","SEAT","TAKE S
               "입장","시작","참여","관전","라이브"]
 NEXT_WORDS = ["NEXT","CONTINUE","OK","CLOSE","DISMISS","SKIP","RESULT","REVEAL","SHOW","START","GO",
               "»","→","▶","⏭","❯","➔","►","आगे","ठीक","बंद","जारी","LIVE"]
+
+# common button selectors used by many providers
+NEXT_SELECTORS = [
+    "button.next","button.deal","button.start","button.ok","button.continue","button.play",
+    ".next-btn",".btn-next",".btn--next",".btn.ok",".btn.start",".btn.continue",".btn.play",
+    "[data-action='next']","[data-action='continue']","[data-action='start']",
+    ".reveal",".result",".show",".start-btn",".continue-btn",".play-btn",
+]
+VIDEO_SELECTORS = [
+    "video",".video-container",".casino-video",".casino-video-cards",".game-video","canvas",".table-video",".main-video"
+]
+
+def click_selectors_in_frame(driver, selectors) -> bool:
+    try:
+        return bool(driver.execute_script("""
+            const sels = arguments[0];
+            const pick = [];
+            for (const s of sels) {
+              const nodes = document.querySelectorAll(s);
+              for (const el of nodes) {
+                if (!el || !el.offsetParent) continue;
+                pick.push(el);
+              }
+            }
+            if (pick.length) {
+              const el = pick[0];
+              el.scrollIntoView({block:'center'});
+              el.click();
+              return true;
+            }
+            return false;
+        """, selectors))
+    except Exception:
+        return False
+
+def click_center_of_video(driver) -> bool:
+    # click the visual surface; many providers require tapping the video/canvas to resume
+    try:
+        return bool(driver.execute_script("""
+            const sels = arguments[0];
+            for (const s of sels) {
+              const el = document.querySelector(s);
+              if (el && el.offsetParent) {
+                const r = el.getBoundingClientRect();
+                const x = r.left + r.width/2, y = r.top + r.height/2;
+                const evt = new MouseEvent('click', {view: window, bubbles: true, cancelable: true, clientX: x, clientY: y});
+                el.dispatchEvent(evt);
+                return true;
+              }
+            }
+            return false;
+        """, VIDEO_SELECTORS))
+    except Exception:
+        return False
 
 def click_tokens_in_this_frame(driver, words) -> bool:
     try:
@@ -638,19 +685,20 @@ def click_tokens_in_this_frame(driver, words) -> bool:
         return False
 
 def deep_join_nudge(driver) -> bool:
+    did = False
     frames = driver.find_elements(By.TAG_NAME, "iframe")
     for fr in frames[:5]:
         try:
             driver.switch_to.frame(fr)
-            if click_tokens_in_this_frame(driver, JOIN_WORDS):
-                print("🟢 Clicked (iframe) join/play/watch", flush=True)
-                driver.switch_to.parent_frame()
-                return True
+            if click_tokens_in_this_frame(driver, JOIN_WORDS) or click_selectors_in_frame(driver, NEXT_SELECTORS) or click_center_of_video(driver):
+                print("🟢 Clicked (iframe) join/play/watch/center", flush=True)
+                did = True
             driver.switch_to.parent_frame()
+            if did: break
         except Exception:
             try: driver.switch_to.parent_frame()
             except Exception: pass
-    return False
+    return did
 
 def poke_next_like(driver) -> bool:
     did = False
@@ -658,8 +706,10 @@ def poke_next_like(driver) -> bool:
     for fr in frames[:5]:
         try:
             driver.switch_to.frame(fr)
-            if click_tokens_in_this_frame(driver, NEXT_WORDS):
-                print("🟢 Clicked (iframe) next/ok", flush=True)
+            if (click_tokens_in_this_frame(driver, NEXT_WORDS)
+                or click_selectors_in_frame(driver, NEXT_SELECTORS)
+                or click_center_of_video(driver)):
+                print("🟢 Clicked (iframe) next/ok/center", flush=True)
                 did = True
             driver.switch_to.parent_frame()
             if did: break
@@ -683,7 +733,7 @@ def reopen_table(driver, next_index: int = 0):
 
     try:
         driver.get(URL); time.sleep(1.0)
-        close_top_modal(driver, attempts=2)  # ensure lobby is clear
+        close_top_modal(driver, attempts=2)
         click_nav_casino(driver)
         close_top_modal(driver, attempts=2)
         if not click_game_subtab(driver): raise RuntimeError("Game subtab not found")
@@ -702,13 +752,13 @@ def reopen_table(driver, next_index: int = 0):
             print("⚠️ Could not open any table tile.", flush=True)
     except Exception as e:
         print(f"⚠️ Re-open navigation error: {e}", flush=True)
-    try: 
+    try:
         reattach_game_iframe(driver)
-        # NEW: immediately try to progress after a reopen
+        # immediate iframe nudges
         deep_join_nudge(driver)
         poke_next_like(driver)
         time.sleep(1.5)
-    except Exception: 
+    except Exception:
         pass
 
 def shadow_signature_hex(driver) -> str:
@@ -736,20 +786,20 @@ def main():
 
         # LOGIN + kill lobby popups
         login_same_site(driver)
-        close_top_modal(driver, attempts=5)              # 1) after login
+        close_top_modal(driver, attempts=5)
 
         WebDriverWait(driver, 30).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         click_nav_casino(driver)
-        close_top_modal(driver, attempts=3)              # 2) after opening Casino
+        close_top_modal(driver, attempts=3)
 
         if not click_game_subtab(driver):
             raise TimeoutException("Could not find required game subtab")
-        close_top_modal(driver, attempts=2)              # 3) after selecting Lucky7/Hi-Low tab
+        close_top_modal(driver, attempts=2)
 
         table_idx = 0
         click_first_game_in_active_pane(driver, idx=table_idx)
 
-        # NEW: immediately nudge join/next inside the provider iframe before first parse
+        # immediate iframe nudges before first parse
         reattach_game_iframe(driver)
         deep_join_nudge(driver)
         poke_next_like(driver)
@@ -820,9 +870,10 @@ def main():
 
                 waited = int(time.time() - gate_start)
 
-                if waited in (6, 12, 18):
-                    if poke_next_like(driver):
-                        reattach_game_iframe(driver)
+                # periodic nudges inside iframe
+                if waited in (4, 8, 12, 16):
+                    poke_next_like(driver)
+                    reattach_game_iframe(driver)
 
                 if waited >= 8 and not joined:
                     try: driver.switch_to.default_content()
@@ -839,7 +890,7 @@ def main():
                     poke_next_like(driver)
                     prev_net = len(network_seen); prev_shadow = shadow_signature_hex(driver)
                     gate_start = time.time(); joined=False; stuck_cycles += 1
-                    # NEW: rotate earlier (after first failed refresh cycle)
+                    # rotate earlier (after first failed refresh cycle)
                     if stuck_cycles >= 1:
                         table_idx = (table_idx + 1) % max(MAX_TABLES, 1)
                         reopen_table(driver, next_index=table_idx)
