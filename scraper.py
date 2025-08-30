@@ -3,7 +3,7 @@
 # - Closes top-page modals (force-change-password, marketing, backdrops) BEFORE opening tables
 # - Prefers "LUCKY 7" pane (HI LOW as fallback)
 # - Clicks join/next only INSIDE provider iframes (prevents header misclicks)
-# - Refreshes / rotates tables if stuck
+# - Refreshes / rotates tables if stuck (aggressive)
 # - Writes clean CSV + optional debug HTML/PNG
 
 import os, re, csv, time, random, json, hashlib
@@ -29,7 +29,7 @@ if not USERNAME or not PASSWORD:
     raise SystemExit("Missing NOH_USER / NOH_PASS environment variables.")
 
 CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
-RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))    # ~50 min
+RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))    # default ~50 min (workflow sets ~18m)
 MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))        # 0 = unlimited
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "90"))
 POLL_SEC      = float(os.getenv("POLL_SEC", "1.0"))
@@ -607,6 +607,7 @@ def dfs_frames_for_card(driver, max_depth=5, depth=0):
 # ---------- Next-round helpers ----------
 EXCLUDE_TOKENS = ("RULE","RULES","HELP","FAQ","TERMS","DISCLAIMER","PRIVACY")
 JOIN_WORDS = ["JOIN","PLAY","ENTER","WATCH","START","LIVE","OPEN","SEAT","TAKE SEAT","SIT","CONTINUE",
+              "PLAY NOW","WATCH LIVE","ENTER TABLE","JOIN TABLE",
               "जॉइन","खेलें","प्रवेश","देखें","लाइव","खोलें",
               "加入","进入","开始","观看","直播","进入游戏","加入游戏",
               "参加","開始","入場","観戦","ライブ",
@@ -701,9 +702,14 @@ def reopen_table(driver, next_index: int = 0):
             print("⚠️ Could not open any table tile.", flush=True)
     except Exception as e:
         print(f"⚠️ Re-open navigation error: {e}", flush=True)
-    try: reattach_game_iframe(driver)
-    except Exception: pass
-    time.sleep(2.0)
+    try: 
+        reattach_game_iframe(driver)
+        # NEW: immediately try to progress after a reopen
+        deep_join_nudge(driver)
+        poke_next_like(driver)
+        time.sleep(1.5)
+    except Exception: 
+        pass
 
 def shadow_signature_hex(driver) -> str:
     try:
@@ -742,6 +748,13 @@ def main():
 
         table_idx = 0
         click_first_game_in_active_pane(driver, idx=table_idx)
+
+        # NEW: immediately nudge join/next inside the provider iframe before first parse
+        reattach_game_iframe(driver)
+        deep_join_nudge(driver)
+        poke_next_like(driver)
+        time.sleep(2.0)
+
         print("✅ Entered Lucky 7 / Hi-Low game", flush=True)
 
         start_ts = time.time()
@@ -826,7 +839,8 @@ def main():
                     poke_next_like(driver)
                     prev_net = len(network_seen); prev_shadow = shadow_signature_hex(driver)
                     gate_start = time.time(); joined=False; stuck_cycles += 1
-                    if stuck_cycles >= 2:
+                    # NEW: rotate earlier (after first failed refresh cycle)
+                    if stuck_cycles >= 1:
                         table_idx = (table_idx + 1) % max(MAX_TABLES, 1)
                         reopen_table(driver, next_index=table_idx)
                         stuck_cycles = 0
