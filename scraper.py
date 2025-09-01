@@ -32,8 +32,8 @@ if not USERNAME or not PASSWORD:
 CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
 RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))
 MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))        # 0 = unlimited
-ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "180")) # Increased timeout
-POLL_SEC      = float(os.getenv("POLL_SEC", "2.0"))    # Increased poll time
+ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "180"))
+POLL_SEC      = float(os.getenv("POLL_SEC", "2.0"))
 DEBUG_DUMP    = int(os.getenv("DEBUG_DUMP", "1"))
 MAX_TABLES    = int(os.getenv("MAX_TABLES", "10"))
 GAME_PREF     = (os.getenv("GAME_PREF") or "LUCKY 7").strip().upper()
