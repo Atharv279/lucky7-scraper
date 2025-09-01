@@ -360,12 +360,12 @@ def collect_network_json_card(driver, seen_json_ids: set) -> Tuple[Optional[Dict
 
 # ---------- Navigation / Modals ----------
 def login_same_site(driver):
-    driver.get(URL); time.sleep(2.0)
+    driver.get(URL); time.sleep(20) # Added wait
     # open login if present
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(0.8)
+    time.sleep(20) # Added wait
     try:
         user_input = driver.find_element(By.XPATH, "//input[@name='User Name' or @name='username' or contains(@placeholder,'User')]")
         pass_input = driver.find_element(By.XPATH, "//input[@name='Password' or @name='password' or @type='password']")
@@ -375,7 +375,8 @@ def login_same_site(driver):
         print("✅ Logged in", flush=True)
     except NoSuchElementException:
         print("⚠️ Login inputs not found; maybe already logged in", flush=True)
-    time.sleep(1.5); dump_debug_html(driver, "after_login")
+    time.sleep(20) # Added wait
+    dump_debug_html(driver, "after_login")
 
 CLOSE_WORDS = [
     "CLOSE","OK","GOT IT","DISMISS","ACCEPT","I AGREE","START","ENTER","WATCH NOW","CONTINUE",
@@ -433,7 +434,7 @@ def close_top_modal(driver, attempts=5) -> bool:
             """, CLOSE_WORDS)
             if clicked:
                 did_any = True
-                time.sleep(1.0)
+                time.sleep(20) # Added wait
         except Exception:
             pass
         try:
@@ -450,7 +451,7 @@ def close_top_modal(driver, attempts=5) -> bool:
 def click_nav_casino(driver, timeout=45):
     def click_it(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
-        time.sleep(0.2)
+        time.sleep(20) # Added wait
         try: el.click()
         except Exception: driver.execute_script("arguments[0].click();", el)
     end = time.time() + timeout
@@ -458,7 +459,7 @@ def click_nav_casino(driver, timeout=45):
         for tg in driver.find_elements(By.XPATH,
             "//button[contains(@class,'navbar-toggler') or contains(@class,'hamburger') or contains(@class,'menu') or @aria-label='Toggle navigation']")[:2]:
             if tg.is_displayed():
-                try: click_it(tg); time.sleep(0.6)
+                try: click_it(tg); time.sleep(20) # Added wait
                 except Exception: pass
         xps = [
             "//a[contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'CASINO')]",
@@ -468,7 +469,7 @@ def click_nav_casino(driver, timeout=45):
         ]
         for xp in xps:
             els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
-            if els: click_it(els[0]); time.sleep(1.5); return
+            if els: click_it(els[0]); time.sleep(20); return # Added wait
         # fallback via JS
         try:
             clicked = bool(driver.execute_script("""
@@ -479,15 +480,15 @@ def click_nav_casino(driver, timeout=45):
                 return false;
             """))
         except Exception: clicked = False
-        if clicked: time.sleep(1.5); return
-        time.sleep(0.5)
+        if clicked: time.sleep(20); return # Added wait
+        time.sleep(20) # Added wait
     raise TimeoutException("Casino link not found")
 
 def click_game_subtab(driver, timeout=45) -> bool:
     targets = [t for t in GAME_TAB_NAMES if t]
     def click_it(el):
         driver.execute_script("arguments[0].scrollIntoView({block:'center', inline:'center'});", el)
-        time.sleep(0.2)
+        time.sleep(20) # Added wait
         try: el.click()
         except Exception: driver.execute_script("arguments[0].click();", el)
     end = time.time() + timeout
@@ -497,19 +498,19 @@ def click_game_subtab(driver, timeout=45) -> bool:
                   "[contains(translate(normalize-space(.),'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'%s')]" % token)
             els = [e for e in driver.find_elements(By.XPATH, xp) if e.is_displayed()]
             if els:
-                click_it(els[0]); time.sleep(1.2)
+                click_it(els[0]); time.sleep(20) # Added wait
                 print(f"🎯 Game tab: {token}", flush=True)
                 return True
         for cont in driver.find_elements(By.XPATH, "//*[contains(@class,'tabs') or contains(@class,'nav') or contains(@class,'tab')]")[:3]:
             try: driver.execute_script("if(arguments[0].scrollWidth>arguments[0].clientWidth){arguments[0].scrollLeft += 240;}", cont)
             except Exception: pass
-        time.sleep(0.5)
+        time.sleep(20) # Added wait
     return False
 
 def reattach_game_iframe(driver):
     try: driver.switch_to.default_content()
     except Exception: pass
-    time.sleep(0.3)
+    time.sleep(20) # Added wait
     frames = driver.find_elements(By.TAG_NAME, "iframe")
     if frames:
         for fr in frames[:5]:
@@ -529,12 +530,12 @@ def click_first_game_in_active_pane(driver, idx: int = 0):
     idx = max(0, min(idx, len(tiles)-1))
     target = tiles[idx]
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-    time.sleep(0.2); safe_click(driver, target)
-    time.sleep(0.8)
+    time.sleep(20); safe_click(driver, target) # Added wait
+    time.sleep(20) # Added wait
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
         print("↪️ Switched to game window")
-    time.sleep(2.0); reattach_game_iframe(driver); dump_debug_html(driver, f"after_enter_game_{idx}")
+    time.sleep(20); reattach_game_iframe(driver); dump_debug_html(driver, f"after_enter_game_{idx}") # Added wait
 
 # ---------- Round parsing ----------
 def try_parse_here(driver):
@@ -721,7 +722,7 @@ def reopen_table(driver, next_index: int = 0):
     except Exception: pass
 
     try:
-        driver.get(URL); time.sleep(1.0)
+        driver.get(URL); time.sleep(20) # Added wait
         close_top_modal(driver, attempts=2)
         click_nav_casino(driver)
         close_top_modal(driver, attempts=2)
@@ -746,7 +747,7 @@ def reopen_table(driver, next_index: int = 0):
         # immediate iframe nudges
         deep_join_nudge(driver)
         poke_next_like(driver)
-        time.sleep(1.5)
+        time.sleep(20) # Added wait
     except Exception:
         pass
 
@@ -792,7 +793,7 @@ def main():
         reattach_game_iframe(driver)
         deep_join_nudge(driver)
         poke_next_like(driver)
-        time.sleep(2.0)
+        time.sleep(20) # Added wait
 
         print("✅ Entered Lucky 7 / Hi-Low game", flush=True)
 
@@ -818,12 +819,12 @@ def main():
                 collect_network_images(driver, seen_img_ids, network_seen)
                 if not parsed and (time.time() - t0) > ROUND_TIMEOUT:
                     print("🔄 Round timeout: refresh + join + next", flush=True)
-                    driver.refresh(); time.sleep(3)
+                    driver.refresh(); time.sleep(20) # Added wait
                     reattach_game_iframe(driver)
                     deep_join_nudge(driver)
                     poke_next_like(driver)
                     t0 = time.time()
-                time.sleep(0.35 + random.uniform(0.05,0.25))
+                time.sleep(20) # Added wait
 
             # ---- save (skip duplicate) ----
             rank, suit = parsed["rank"], parsed["suit_key"]
@@ -873,7 +874,7 @@ def main():
 
                 if waited >= 20:
                     print("🔁 No change — refreshing table", flush=True)
-                    driver.refresh(); time.sleep(3)
+                    driver.refresh(); time.sleep(20) # Added wait
                     reattach_game_iframe(driver)
                     deep_join_nudge(driver)
                     poke_next_like(driver)
@@ -892,11 +893,11 @@ def main():
                     print(f"🟡 Next-round gate… net={len(network_seen)} (prev {prev_net}) shadow={'same' if sig_now==prev_shadow else 'changed'} waited={waited}s", flush=True)
 
                 if RUN_SECONDS and (time.time()-start_ts) >= RUN_SECONDS: break
-                time.sleep(0.6 + random.uniform(0.0,0.3))
+                time.sleep(20) # Added wait
 
             if (MAX_ROUNDS and saved >= MAX_ROUNDS) or (RUN_SECONDS and (time.time()-start_ts) >= RUN_SECONDS):
                 print(f"🏁 Done — captured {saved} rounds.", flush=True); break
-            time.sleep(POLL_SEC)
+            time.sleep(20) # Added wait
 
     except KeyboardInterrupt:
         print("🛑 Stopped by user", flush=True)
