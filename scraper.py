@@ -175,6 +175,17 @@ def extract_card_sources_from_html(html: str) -> List[str]:
         if m2: add(f"/{m2.group(1).upper()}{m2.group(2).upper()}.png")
     return urls
 
+def js_collect_hints(driver):
+    try: return driver.execute_script(JS_HINTS) or []
+    except Exception: return []
+
+def js_collect_shadow(driver):
+    try:
+        data = driver.execute_script(JS_SHADOW_COLLECT) or {}
+        return (data.get("urls", []) or [], data.get("toks", []) or [])
+    except Exception:
+        return [], []
+
 JS_HINTS = r"""
 const out = [];
 const add = (k,v) => { if (!v) return; const s=String(v).trim(); if (!s) return; out.push([k,s]); };
