@@ -23,7 +23,7 @@ from selenium.common.exceptions import TimeoutException, NoSuchElementException,
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ---------- ENV ----------
-URL           = os.getenv("LUCKY7_URL", "https://nohmy99.vip/home")
+URL           = os.getenv("LUCKY7_URL", "https://www.nohmy99.vip/m/home")
 USERNAME      = os.getenv("NOH_USER")
 PASSWORD      = os.getenv("NOH_PASS")
 if not USERNAME or not PASSWORD:
@@ -251,17 +251,6 @@ while (stack.length){
 }
 return { urls: Array.from(out).slice(0,800), toks: toks.slice(0,800) };
 """
-
-def js_collect_hints(driver):
-    try: return driver.execute_script(JS_HINTS) or []
-    except Exception: return []
-
-def js_collect_shadow(driver):
-    try:
-        data = driver.execute_script(JS_SHADOW_COLLECT) or {}
-        return (data.get("urls", []) or [], data.get("toks", []) or [])
-    except Exception:
-        return [], []
 
 def tokens_from_js_hints(hints):
     toks = []
