@@ -33,7 +33,7 @@ CSV_PATH      = os.getenv("CSV_PATH", "lucky7_data.csv")
 RUN_SECONDS   = int(os.getenv("RUN_SECONDS", "3000"))
 MAX_ROUNDS    = int(os.getenv("MAX_ROUNDS", "0"))        # 0 = unlimited
 ROUND_TIMEOUT = int(os.getenv("ROUND_TIMEOUT", "180"))
-POLL_SEC      = float(os.getenv("POLL_SEC", "2.0"))
+POLL_SEC      = float(os.getenv("POLL_SEC", "1.0"))
 DEBUG_DUMP    = int(os.getenv("DEBUG_DUMP", "1"))
 MAX_TABLES    = int(os.getenv("MAX_TABLES", "10"))
 GAME_PREF     = (os.getenv("GAME_PREF") or "LUCKY 7").strip().upper()
@@ -174,17 +174,6 @@ def extract_card_sources_from_html(html: str) -> List[str]:
         m2 = re.search(r"rank[-_ ]?(A|10|[2-9]|J|Q|K).*?suit[-_ ]?([shdc])", cls, re.I)
         if m2: add(f"/{m2.group(1).upper()}{m2.group(2).upper()}.png")
     return urls
-
-def js_collect_hints(driver):
-    try: return driver.execute_script(JS_HINTS) or []
-    except Exception: return []
-
-def js_collect_shadow(driver):
-    try:
-        data = driver.execute_script(JS_SHADOW_COLLECT) or {}
-        return (data.get("urls", []) or [], data.get("toks", []) or [])
-    except Exception:
-        return [], []
 
 JS_HINTS = r"""
 const out = [];
