@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
-# Lucky 7 / Hi-Low Scraper — CI-ready (iframe join/next nudges + video-center click)
-# - Kills lobby modals
-# - Prefers LUCKY 7 (falls back to HI LOW)
-# - Clicks join/next *inside provider iframes* (text + explicit selectors)
-# - Also clicks center of video/canvas inside iframe to resume
-# - Rotates tables aggressively if stuck
-# - Writes clean CSV + debug HTML/PNG
+"""
+Lucky 7 — Single-File Scraper (GitHub-ready, non-headless) v3.0
 
-import os, re, csv, time, random, json, hashlib
+What this does
+- Logs into the same site, navigates: Casino → Lucky 7 → first game.
+- Enters game iframe when present.
+- Scrapes the open card by reading the card image URL (DT-style parsing).
+- Parses rank & suit from URL patterns (e.g., /8D.png, /10CC.webp, queen_of_spades.png).
+- Skips closed/back placeholders (e.g., 1_card_20_20.webp, alt="closed").
+- Saves a clean CSV with a single 'result' column (below7/seven/above7).
+- Runs for MAX_ROUNDS per run (default 20), then exits (for CI schedules).
+"""
+
+import os, re, csv, time, random
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Tuple, List
+from typing import Optional, Dict, Any
 
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, NoSuchElementException, WebDriverException
+from selenium.common.exceptions import NoSuchElementException, TimeoutException
 from webdriver_manager.chrome import ChromeDriverManager
 
 # ===================== CONFIG =====================
@@ -153,7 +157,7 @@ def make_driver():
     opts.add_argument("--log-level=3")
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
-def W(driver, cond, timeout=15):
+def W(driver, cond, timeout=30):
     return WebDriverWait(driver, timeout).until(cond)
 
 def safe_click(driver, el):
@@ -165,26 +169,26 @@ def safe_click(driver, el):
 # ===================== Site flow =====================
 def login_same_site(driver):
     driver.get(URL)
-    time.sleep(2.0)
+    time.sleep(5.0)
     # Open login form
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(1.0)
+    time.sleep(3.0)
     # Fill creds
     try:
-        user_input = driver.find_element(By.XPATH, "//input[@name='User Name']")
-        pass_input = driver.find_element(By.XPATH, "//input[@name='Password']")
+        user_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='User Name']")))
+        pass_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='Password']")))
         user_input.clear(); user_input.send_keys(USERNAME)
         pass_input.clear(); pass_input.send_keys(PASSWORD)
         pass_input.submit()
-    except NoSuchElementException:
+    except (NoSuchElementException, TimeoutException):
         pass  # maybe already logged in
 
 def click_nav_casino(driver):
     el = W(driver, EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/casino/') or contains(., 'Casino')]")))
     safe_click(driver, el)
-    time.sleep(1.0 + random.uniform(0.1,0.4))
+    time.sleep(5.0 + random.uniform(0.1,0.4))
 
 def click_lucky7_subtab(driver):
     el = W(driver, EC.element_to_be_clickable((
@@ -193,7 +197,7 @@ def click_lucky7_subtab(driver):
         "contains(translate(., 'abcdefghijklmnopqrstuvwxyz','ABCDEFGHIJKLMNOPQRSTUVWXYZ'),'LUCKY7')]"
     )))
     safe_click(driver, el)
-    time.sleep(1.0 + random.uniform(0.1,0.4))
+    time.sleep(5.0 + random.uniform(0.1,0.4))
 
 def click_first_game_in_active_pane(driver):
     try:
@@ -210,11 +214,11 @@ def click_first_game_in_active_pane(driver):
     if not target:
         raise RuntimeError("No game tiles found in Lucky 7 pane")
     driver.execute_script("arguments[0].scrollIntoView({block:'center'});", target)
-    time.sleep(0.2 + random.uniform(0.05,0.2)); safe_click(driver, target)
-    time.sleep(0.6)
+    time.sleep(2.0 + random.uniform(0.05,0.2)); safe_click(driver, target)
+    time.sleep(5.0)
     if len(driver.window_handles) > 1:
         driver.switch_to.window(driver.window_handles[-1])
-    time.sleep(2.0)
+    time.sleep(5.0)
     iframes = driver.find_elements(By.TAG_NAME, "iframe")
     if iframes:
         driver.switch_to.frame(iframes[0])
@@ -238,7 +242,7 @@ def main():
     try:
         # Login + nav
         login_same_site(driver)
-        W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 20)
+        W(driver, EC.presence_of_element_located((By.TAG_NAME, "body")), 30)
         click_nav_casino(driver)
         click_lucky7_subtab(driver)
         click_first_game_in_active_pane(driver)
@@ -285,13 +289,13 @@ def main():
                     break
 
                 if time.time() - t0 > ROUND_TIMEOUT:
-                    driver.refresh(); time.sleep(5)
+                    driver.refresh(); time.sleep(10)
                     ifr = driver.find_elements(By.TAG_NAME, "iframe")
                     if ifr:
                         driver.switch_to.frame(ifr[0])
                     t0 = time.time()
 
-                time.sleep(0.3 + random.uniform(0.05,0.2))
+                time.sleep(1.0 + random.uniform(0.05,0.2))
 
             rid = find_round_id_text(driver)
             rank, suit = parsed["rank"], parsed["suit_key"]
