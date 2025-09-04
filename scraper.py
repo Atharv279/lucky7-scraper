@@ -156,7 +156,8 @@ def make_driver():
     opts.add_argument("--log-level=3")
     return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
-def W(driver, cond, timeout=30):
+# Increased the default timeout to 60 seconds
+def W(driver, cond, timeout=60):
     return WebDriverWait(driver, timeout).until(cond)
 
 def safe_click(driver, el):
@@ -172,7 +173,7 @@ def login_same_site(driver):
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
-    time.sleep(3.0)
+    time.sleep(5.0)
     try:
         user_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='User Name']")))
         pass_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='Password']")))
@@ -183,6 +184,7 @@ def login_same_site(driver):
         pass
 
 def click_nav_casino(driver):
+    time.sleep(10.0) # Added explicit wait here
     el = W(driver, EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/casino/') or contains(., 'Casino')]")))
     safe_click(driver, el)
     time.sleep(5.0 + random.uniform(0.1,0.4))
