@@ -149,7 +149,6 @@ def extract_card_img_urls(html: str) -> list[str]:
 # ===================== Selenium helpers =====================
 def make_driver():
     opts = Options()
-    # non-headless; use Xvfb in CI for a virtual display
     opts.add_argument("--disable-gpu")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
@@ -170,12 +169,10 @@ def safe_click(driver, el):
 def login_same_site(driver):
     driver.get(URL)
     time.sleep(5.0)
-    # Open login form
     for link in driver.find_elements(By.CSS_SELECTOR, "a.auth-link.m-r-5"):
         if link.text.strip().lower() == "login":
             safe_click(driver, link); break
     time.sleep(3.0)
-    # Fill creds
     try:
         user_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='User Name']")))
         pass_input = W(driver, EC.visibility_of_element_located((By.XPATH, "//input[@name='Password']")))
@@ -183,7 +180,7 @@ def login_same_site(driver):
         pass_input.clear(); pass_input.send_keys(PASSWORD)
         pass_input.submit()
     except (NoSuchElementException, TimeoutException):
-        pass  # maybe already logged in
+        pass
 
 def click_nav_casino(driver):
     el = W(driver, EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, '/casino/') or contains(., 'Casino')]")))
